@@ -25,7 +25,7 @@ Windows 上的 DSH 默认只有 PowerShell 执行器；各内置预设把 `tool-
 
 ~~~powershell
 # 1) 装到技能目录（目录名保持 dsh-windows-shell-toolchain）
-Expand-Archive dsh-windows-shell-toolchain-v1.0.1.zip -DestinationPath "$env:USERPROFILE\.dsh\skills" -Force
+Expand-Archive dsh-windows-shell-toolchain-v1.0.2.zip -DestinationPath "$env:USERPROFILE\.dsh\skills" -Force
 
 # 2) 先看看会下载什么（不实际下载）
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\skills\dsh-windows-shell-toolchain\scripts\setup-tools.ps1" -ResolveOnly
