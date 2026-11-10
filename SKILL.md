@@ -57,18 +57,27 @@ whenToUse: 在 Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell
 
 所以「让 Windows 有 bash」只有两条路：
 
-1. **保证 PATH 里有真 bash**，再放开 tool-bash（本技能走这条，靠 PortableGit）；
+1. **保证 PATH 里有真 bash，再把执行器换成 bash**（本技能走这条，靠 PortableGit）；
 2. 另写一个自带执行器的插件（不推荐：要把代码绑进官方会变的内部结构，官方一升级就得追）。
 
-### 本技能的选择与代价（说清楚，不粉饰）
+### 执行器必须选 bash-sandbox，不能选 bash-local
 
-- 选择：禁用 pwsh-sandbox，挂 dsh-bash-local 作为 ctx.shell，放开 tool-bash。
-- 代价一：`pwsh` 工具会变成「名字叫 pwsh、实际由 bash 执行」，PowerShell 语法会报错；profile patch 改不动预设层那份 tool-pwsh，禁不干净。用 bash 工具，需要 PowerShell 时显式调 `pwsh -NoProfile -Command`。
-- 代价二：命令以 harness 进程权限直接运行，文件沙箱不再参与。
-- 若哪天想要「保留官方执行器 + 新增 bash 工具 + 全预设生效」，那是插件形态的活，不是 skill 能做的；本技能不做那件事，也不依赖任何插件。
+`@deepseek-ai/dsh-permission-presets` 构造时有一道硬检查：
+
+    if (ctx.shell.sandboxMode === void 0) throw new Error("permission: the mounted bash executor does not confine (no sandboxMode) ...");
+
+权限预设要求 shell 执行器**自称能隔离**。`dsh-bash-local` 没有 `sandboxMode`，挂上去会让权限预设插件拒绝挂载，聊天框的模式选择器和 `/permission` 命令会一起消失。`dsh-bash-sandbox` 是它的子类，只多了 `sandboxMode` 与隔离装饰；在 `danger-full-access` 档下它直接走父类执行、不套任何约束，命令手感与 `bash-local` 完全一致。
+
+它官方标称 POSIX-only：受限档（read-only / workspace-write）的沙箱 runner 在 Windows 上能否起来**未验证**。一旦受限档报错，切回 danger-full-access 即可。
+
+### 已知代价
+
+- `pwsh` 工具名存实亡：执行器是 bash，PowerShell 语法会报错；profile patch 改不动预设层那份 tool-pwsh，禁不干净。需要 PowerShell 时显式调 `pwsh -NoProfile -Command '...'`。
+- 命令以 harness 进程权限运行，约束由当前权限档决定，不再来自 pwsh-sandbox。
+
 ## 6. PATH 与 spawn 解析（成败关键）
 
-dsh-bash-local 硬编码 spawn('bash')，**没有 bashPath 之类配置项**。所以：
+bash 执行器（`bash-local` 与 `bash-sandbox` 同源）硬编码 spawn('bash')，**没有 bashPath 之类配置项**。所以：
 
 - bash 必须能被 PATH 解析到，装在哪不重要，进 PATH 才重要；
 - 改用户 PATH 只对**新进程**生效，正在跑的 DSH 用的是旧 PATH → 必须重启 DSH；
@@ -96,11 +105,11 @@ patch 语义：**按 id 定位的条目是整条替换，不深合并**（官方
     - id: pwsh-sandbox
       name: '@deepseek-ai/dsh-pwsh-sandbox'
       disabled: true
-    - insert:
-        - id: bash
-          name: '@deepseek-ai/dsh-bash-local'
-          config:
-            cwd: '<workspace>'
+    - id: bash-sandbox
+      name: '@deepseek-ai/dsh-bash-sandbox'
+      disabled: false
+      config:
+        cwd: '<workspace>'
 
 写完先解析校验 YAML 再落盘（profile 目录里的 js-yaml 或任意 YAML 解析器都行）。
 
