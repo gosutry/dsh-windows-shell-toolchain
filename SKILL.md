@@ -58,6 +58,9 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
 
 文件：`<DSH home>\profiles\<profile>\cordis.patch.yml`，追加到末尾。
 
+- `<DSH home>` 默认 `%USERPROFILE%\.dsh`，可用环境变量 `DSH_HOME` 覆盖
+- `<profile>` 是 `profiles\` 下的目录名（桌面版通常为 `desktop`）
+
 - 按 id 定位的条目**整条替换、不深合并**：要保留的字段（尤其 `name`）必须重述
 - 新增插件写 `insert` 列表，单个 id 条目插不进去
 
@@ -78,6 +81,8 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
 
 写完先解析校验 YAML 再落盘。
 
+`tool-pwsh` 那条 `disabled: true` 只关掉 bundle 层那份，每个预设自己也挂了一份，profile patch 够不到——所以 `pwsh` 工具仍会出现在工具表里。用 `bash` 工具，需要 PowerShell 时显式调 `pwsh -NoProfile -Command '...'`。
+
 ## 8. 验收
 
     scripts\restart-dsh.cmd
@@ -85,6 +90,7 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
 1. 工具表里有 `bash`
 2. `echo $0; uname -s; pwd` → exit 0，输出 bash 路径 + MINGW/MSYS + 目标目录
 3. 开 subagent，让它自报工具名并实跑一条
+4. 聊天框的权限选择器与 `/permission` 命令仍在（换执行器最容易丢的就是这个）
 
 ## 9. 故障
 
@@ -122,6 +128,19 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
 | `-SkipGit` / `-SkipPs7` / `-SkipPath` | 关 | 拆步执行 |
 
 架构自动识别：ARM64 取 arm64 资产，其余 x64。
+
+### 参数（restore.ps1）
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `-Snapshot` | — | 建立快照（改动前跑） |
+| `-DryRun` | 关 | 只比对不写盘 |
+| `-RestorePath` | 关 | 还原时连用户 PATH 一起还原 |
+| `-Restart` | 关 | 还原后重启 DSH |
+| `-DshHome` | `%USERPROFILE%\.dsh` | DSH 主目录（决定去哪找 profile） |
+| `-Profiles` | 自动发现 | 指定 profile 目录名，多个用逗号 |
+| `-Extra` | 空 | 额外要纳入快照的文件，`;` 分隔 |
+| `-StateDir` | `%LOCALAPPDATA%\dsh-windows-shell` | 快照存放目录 |
 
 ### 回滚与卸载
 
