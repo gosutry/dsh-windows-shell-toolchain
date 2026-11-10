@@ -110,7 +110,6 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
 |---|---|
 | `SKILL.md` | 执行源，即本文 |
 | `scripts/setup-tools.ps1` | 解析版本 → 下载 → 解压 → 验签 → 写用户 PATH（纯 ASCII，5.1 可跑） |
-| `scripts/verify.ps1` | 检查 bash、PowerShell 7、PATH 是否到位 |
 | `scripts/restore.ps1` | 快照、dry-run 比对、逐字节还原配置、还原用户 PATH、重启 DSH |
 | `scripts/restart-dsh.ps1` | 重启 DSH，让新 PATH 生效 |
 | `scripts/restart-dsh.cmd` | 上面那个的双击入口 |
