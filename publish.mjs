@@ -10,11 +10,11 @@ import path from 'node:path';
 const TOKEN = process.env.GH_TOKEN || '';
 if (!TOKEN) { console.error('GH_TOKEN is not set.'); process.exit(1); }
 
-const NAME = 'dsh-windows-shell-setup';
+const NAME = 'dsh-windows-shell-toolchain';
 const DESCRIPTION = 'Agent skill: give DeepSeek Harness a real bash executor on Windows (PortableGit + PowerShell 7), no admin, fully revertible.';
 const TOPICS = ['dsh', 'deepseek-harness', 'agent-skills', 'agent-skill', 'windows', 'git-bash', 'bash', 'powershell', 'portablegit', 'shell'];
 const TAG = process.env.RELEASE_TAG || 'v1.0.0';
-const ASSET = process.env.RELEASE_ASSET || 'E:/DSH/dist/dsh-windows-shell-setup-20261110.zip';
+const ASSET = process.env.RELEASE_ASSET || 'E:/DSH/dist/dsh-windows-shell-toolchain-20261111.zip';
 const REPO_DIR = path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, '$1'));
 
 function curl(args) {
