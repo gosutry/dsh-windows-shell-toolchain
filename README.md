@@ -19,13 +19,13 @@ Windows 上的 DSH 默认只有 PowerShell 执行器；各内置预设把 `tool-
 本技能做两件事：
 
 1. 用 PortableGit 装一个**真 bash**，放进用户 PATH；
-2. 用便携版 PowerShell 7 补上 pwsh 7，并把 DSH 的 profile 配置切到 bash 执行器。
+2. 用便携版 PowerShell 7 补上 pwsh 7，并把 DSH 的 profile 执行器换成 **`bash-sandbox`**（带 `sandboxMode`，因此权限预设与 `/permission` 不受影响）。
 
 ## 安装
 
 ~~~powershell
 # 1) 装到技能目录（目录名保持 dsh-windows-shell-toolchain）
-Expand-Archive dsh-windows-shell-toolchain-20261111.zip -DestinationPath "$env:USERPROFILE\.dsh\skills" -Force
+Expand-Archive dsh-windows-shell-toolchain-v1.0.1.zip -DestinationPath "$env:USERPROFILE\.dsh\skills" -Force
 
 # 2) 先看看会下载什么（不实际下载）
 powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\skills\dsh-windows-shell-toolchain\scripts\setup-tools.ps1" -ResolveOnly
@@ -46,9 +46,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\skill
 |---|---|---|
 | `%LOCALAPPDATA%\dsh-tools` | 解压 PortableGit 与 PowerShell 7 | 删目录 |
 | 用户 PATH | 追加两个目录 | `restore.ps1 -RestorePath` |
-| `<DSH home>\profiles\*\cordis.patch.yml` | 追加一段执行器切换条目 | `restore.ps1` 逐字节还原 |
+| `<DSH home>\profiles\*\cordis.patch.yml` | 追加一段执行器切换条目（`bash-sandbox`） | `restore.ps1` 逐字节还原 |
 
-**代价（写在明面上）**：切换后 `pwsh` 工具名存实亡（实际由 bash 执行，PowerShell 语法会报错），需要 PowerShell 时显式调 `pwsh -NoProfile -Command`；命令也不再经过文件沙箱。细节见 SKILL.md §5.1。
+**代价（写在明面上）**：切换后 `pwsh` 工具名存实亡（执行器是 bash，PowerShell 语法会报错），需要 PowerShell 时显式调 `pwsh -NoProfile -Command`。执行器必须用 `bash-sandbox` 而不是 `bash-local`：后者没有 `sandboxMode`，会让权限预设插件拒绝挂载、聊天框的模式选择器消失。细节见 SKILL.md §5.1。
 
 ## 回滚
 
@@ -61,8 +61,8 @@ restore.ps1 -Restart         # 还原并重启 DSH
 
 ## 已验证 / 未验证
 
-- 已验证：PortableGit 解压出的 bash 与系统 Git 的 bash 同为 `5.3.15(2)-release`；PowerShell 7.6.9 便携版签名 Valid、可运行；脚本在 Windows PowerShell 5.1 下语法通过。
-- 未验证：整条链路在「全新无 Git / 无 PS7」的机器上端到端跑通（PowerShell 7 的下载→验签→解压这一段尚未在干净机器上完整走完）。
+- 已验证：PortableGit 解压出的 bash 与系统 Git 的 bash 同为 `5.3.15(2)-release`；PowerShell 7.6.9 便携版签名 Valid、可运行；`bash-sandbox` 作执行器时 bash 工具 exit 0 且上报 `sandbox: {mode: danger-full-access}`，权限预设选择器与 `/permission` 正常；脚本在 Windows PowerShell 5.1 下语法通过。
+- 未验证：整条链路在「全新无 Git / 无 PS7」的机器上端到端跑通；`bash-sandbox` 在 read-only / workspace-write 档下的沙箱 runner 在 Windows 上能否启动。
 
 ## English summary
 

@@ -1,23 +1,20 @@
-# v1.0.0
+# v1.0.1
 
-首个公开版本。
+修正执行器选型：改用 `bash-sandbox`，此前用 `bash-local` 会让权限预设插件拒绝挂载。
 
-## 内容
+## 变更
 
-- `setup-tools.ps1`：解析最新版本 → 下载（可选镜像）→ 解压 → 验签 → 写用户 PATH
-- `restore.ps1`：快照 / dry-run / 逐字节还原 / 还原 PATH / 重启 DSH
-- `verify.ps1`：检查 bash、PowerShell 7、PATH
-- `restart-dsh.cmd`：重启 DSH
-- `SKILL.md`：探测判据、安装步骤、profile patch 形状、故障对照、已知代价
+- profile 补丁：`insert` 挂 `bash-local` 改为放开内置的 `bash-sandbox`（带 `sandboxMode`）
+- SKILL.md §5.1：写明 `@deepseek-ai/dsh-permission-presets` 的 `ctx.shell.sandboxMode` 硬检查，以及为什么不能用 `bash-local`
+- README：同步执行器说明与已知代价
 
-## 已验证
+## 已验证（Windows 11 22631 + DSH 0.2.2-rc.1）
 
-- Windows 11 (22631) + DSH 0.2.2-rc.1
-- bash `5.3.15(2)-release`（PortableGit 与系统 Git 版本一致）
-- PowerShell `7.6.9` 便携版，签名 Valid（CN=Microsoft Corporation）
+- bash 工具 exit 0，`SHELL=/usr/bin/bash`，上报 `sandbox: {mode: danger-full-access}`
+- 权限预设选择器与 `/permission` 正常工作
+- PowerShell 7.6.9 便携版签名 Valid
 
-## 已知限制
+## 未验证
 
-- `pwsh` 工具在切换后会名存实亡（由 bash 执行），需显式 `pwsh -NoProfile -Command`
-- 切换后命令不经文件沙箱
-- 全新无 Git/无 PS7 机器的完整端到端流程尚未实测
+- 受限档（read-only / workspace-write）下 Windows 的沙箱 runner 能否启动
+- 全新无 Git / 无 PS7 机器的完整端到端流程
