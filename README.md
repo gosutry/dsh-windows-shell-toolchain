@@ -1,4 +1,4 @@
-# dsh-windows-shell
+# dsh-windows-shell-setup
 
 > 给 **DeepSeek Harness (DSH)** 在 Windows 上配一个真正的 bash 执行器，并把 PowerShell 7 便携版一并装好。**不需要管理员**，全程可回滚。
 
@@ -24,19 +24,19 @@ Windows 上的 DSH 默认只有 PowerShell 执行器；各内置预设把 `tool-
 ## 安装
 
 ~~~powershell
-# 1) 装到技能目录（目录名保持 dsh-windows-shell）
-Expand-Archive dsh-windows-shell-20261110.zip -DestinationPath "$env:USERPROFILE\.dsh\skills" -Force
+# 1) 装到技能目录（目录名保持 dsh-windows-shell-setup）
+Expand-Archive dsh-windows-shell-setup-20261110.zip -DestinationPath "$env:USERPROFILE\.dsh\skills" -Force
 
 # 2) 先看看会下载什么（不实际下载）
-powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\skills\dsh-windows-shell\scripts\setup-tools.ps1" -ResolveOnly
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\skills\dsh-windows-shell-setup\scripts\setup-tools.ps1" -ResolveOnly
 
 # 3) 正式安装（默认 %LOCALAPPDATA%\dsh-tools）
-powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\skills\dsh-windows-shell\scripts\setup-tools.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:USERPROFILE\.dsh\skills\dsh-windows-shell-setup\scripts\setup-tools.ps1"
 
 # 4) 重启 DSH，让新 PATH 生效
 ~~~
 
-然后让你的 agent 加载这个技能（`dsh-windows-shell`），按 SKILL.md 第 7 节改 profile 补丁即可。
+然后让你的 agent 加载这个技能（`dsh-windows-shell-setup`），按 SKILL.md 第 7 节改 profile 补丁即可。
 
 常用参数：`-Root` 装到别处、`-Mirror` 走下载加速、`-Offline` 只用已有包、`-SkipGit` / `-SkipPs7` 拆步。
 

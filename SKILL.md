@@ -1,5 +1,5 @@
 ---
-name: dsh-windows-shell
+name: dsh-windows-shell-setup
 description: 把 DSH 在 Windows 上的命令执行环境搭好：一个真 bash（PortableGit）当执行器，外加 PowerShell 7 便携版。当新机器上 bash 工具不存在、或只有 Windows PowerShell 5.1 时使用。全程不需要管理员。
 whenToUse: 在 Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；或用户要求「把这套装到新电脑」。先做 §2 探测，再按 §3 判据表决定做哪几步。POSIX 平台不需要本技能。
 ---
