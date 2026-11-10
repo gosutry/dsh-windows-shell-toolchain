@@ -11,7 +11,7 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
 1. 先快照：`scripts/restore.ps1 -Snapshot`
 2. PowerShell 脚本写纯 ASCII（5.1 按 ANSI 读无 BOM UTF-8）
 3. 不碰 presets 内部 id
-4. 顺序：验证 spawn → 改配置 → 重启 → 验收
+4. 顺序：验证 spawn → 改配置 → 重启 → 验收；每步都要有实测输出
 
 ## 2. 探测
 
@@ -96,25 +96,38 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
 | 当前会话工具表不变 | 预设只影响新建 agent → 用 subagent 或新会话验收 |
 | `Unknown agent preset` | 用不完整条目覆盖了预设节点 → `restore.ps1` 还原 |
 
-## 10. 参数
+## 10. 说明
+
+### 文件
+
+| 文件 | 作用 |
+|---|---|
+| `SKILL.md` | 执行源，即本文 |
+| `scripts/setup-tools.ps1` | 解析版本 → 下载 → 解压 → 验签 → 写用户 PATH（纯 ASCII，5.1 可跑） |
+| `scripts/verify.ps1` | 检查 bash、PowerShell 7、PATH 是否到位 |
+| `scripts/restore.ps1` | 快照、dry-run 比对、逐字节还原配置、还原用户 PATH、重启 DSH |
+| `scripts/restart-dsh.ps1` | 重启 DSH，让新 PATH 生效 |
+| `scripts/restart-dsh.cmd` | 上面那个的双击入口 |
+
+### 参数（setup-tools.ps1）
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
-| `-Root` | `%LOCALAPPDATA%\dsh-tools` | 安装根目录 |
+| `-Root` | `%LOCALAPPDATA%\dsh-tools` | 安装根目录，可指到任意盘 |
 | `-GitVersion` | `latest` | PortableGit 版本或固定号 |
 | `-Ps7Version` | `latest` | PowerShell 版本或固定号 |
 | `-Mirror` | 空 | 可选下载前缀，先试它再试 origin |
-| `-ResolveOnly` | 关 | 只打印下载 URL，不下载 |
+| `-ResolveOnly` | 关 | 只打印下载 URL，不下载（测网络用） |
 | `-Offline` | 关 | 只用已有包，不联网 |
 | `-SkipGit` / `-SkipPs7` / `-SkipPath` | 关 | 拆步执行 |
 
 架构自动识别：ARM64 取 arm64 资产，其余 x64。
 
-## 11. 回滚
+### 回滚与卸载
 
-    scripts\restore.ps1 -DryRun          # 只看差异
+    scripts\restore.ps1 -DryRun          # 只看差异，不写盘
     scripts\restore.ps1                  # 逐字节还原配置
-    scripts\restore.ps1 -RestorePath     # 连用户 PATH 还原
-    scripts\restore.ps1 -Restart         # 还原并重启
+    scripts\restore.ps1 -RestorePath     # 连用户 PATH 一起还原
+    scripts\restore.ps1 -Restart         # 还原后重启 DSH
 
-卸载 = 还原配置 + 从用户 PATH 删掉两个目录 + 删除 `-Root` 目录。
+卸载 = 还原配置 + 从用户 PATH 删掉装的两个目录 + 删除 `-Root` 目录。
