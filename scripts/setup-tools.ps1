@@ -25,6 +25,12 @@
     -Launcher        write <Root>\launch-dsh.cmd so DSH can be started with these dirs first
     -Offline         never use the network; reuse archives already under -Root
     -SkipPath / -SkipGit / -SkipPs7
+    -KeepArchives    keep downloaded archives (default: delete them once extracted and on PATH)
+    -KeepOldVersions keep retired version directories (default: delete them after an upgrade)
+
+  Cleanup runs on every invocation, including the no-op case where the machine is already
+  current: leftover archives from an earlier run are removed then. Only direct children of
+  -Root are ever touched, and only when they look like something this script installed.
 #>
 [CmdletBinding()]
 param(
@@ -43,6 +49,8 @@ param(
   [switch]$SkipPath,
   [switch]$SkipGit,
   [switch]$SkipPs7,
+  [switch]$KeepArchives,
+  [switch]$KeepOldVersions,
   [int]$ProbeTimeoutSec = 25
 )
 
@@ -427,6 +435,141 @@ function Write-Launcher([string[]]$Dirs) {
   Write-Log 'Use it to start DSH when a WSL bash.exe sits in System32; a user PATH entry cannot outrank it.'
 }
 
+# Cleanup -------------------------------------------------------------------
+# Deletes only what this script installed: direct children of -Root that carry the shapes it
+# creates. Anything the user already had on the machine lives outside -Root and is never in scope.
+function Get-DirectChildOfRoot([string]$Path) {
+  $res = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+  $rootRes = Resolve-Path -LiteralPath $Root -ErrorAction SilentlyContinue
+  if (-not $res -or -not $rootRes) { return $null }
+  $full = $res.Path.TrimEnd('\')
+  $rootFull = $rootRes.Path.TrimEnd('\')
+  if (-not $full.StartsWith($rootFull + '\')) { return $null }
+  $rel = $full.Substring($rootFull.Length + 1)
+  if ($rel.Contains('\')) { return $null }
+  return $full
+}
+
+function Get-ManagedKind([string]$Name) {
+  if ($Name.StartsWith('git-')) { return 'git' }
+  if ($Name.StartsWith('PowerShell-')) { return 'pwsh' }
+  return ''
+}
+
+function Test-ManagedDirExe([string]$Kind, [string]$DirPath) {
+  if ($Kind -eq 'git') { return (Test-Path -LiteralPath (Join-Path $DirPath 'bin\bash.exe')) }
+  if ($Kind -eq 'pwsh') { return (Test-Path -LiteralPath (Join-Path $DirPath 'pwsh.exe')) }
+  return $false
+}
+
+# PortableGit-2.56.1-64-bit.7z.exe -> git-2.56.1 ; PowerShell-7.7.0-win-x64.zip -> PowerShell-7.7.0
+function Get-ArchiveTargetDir([string]$Name) {
+  if ($Name.StartsWith('PortableGit-')) {
+    $rest = $Name.Substring(12)
+    $i = $rest.IndexOf('-64-bit')
+    if ($i -lt 0) { $i = $rest.IndexOf('-arm64') }
+    if ($i -gt 0) { return 'git-' + $rest.Substring(0, $i) }
+    return ''
+  }
+  if ($Name.StartsWith('PowerShell-')) {
+    $rest = $Name.Substring(11)
+    $i = $rest.IndexOf('-win-')
+    if ($i -gt 0) { return 'PowerShell-' + $rest.Substring(0, $i) }
+    return ''
+  }
+  return ''
+}
+
+function Remove-OnePath([string]$Path, [switch]$AsDir) {
+  try {
+    Remove-Item -LiteralPath $Path -Recurse:$AsDir -Force -ErrorAction Stop
+    return $true
+  } catch {
+    $msg = $_.Exception.Message
+    $nl = [char]10
+    if ($msg.Contains($nl)) { $msg = $msg.Split($nl)[0] }
+    Write-Plan ('cleanup: cannot delete ' + $Path + ' (' + $msg + ') - will retry next run')
+    return $false
+  }
+}
+
+# Runs on every invocation, including the no-op case where the machine is already current.
+function Invoke-Cleanup([string[]]$ActiveDirs) {
+  Write-Log ''
+  Write-Log '=== cleanup ==='
+  if (-not (Test-Path -LiteralPath $Root)) { Write-Plan 'nothing to clean (no install root)'; return }
+  $active = @()
+  foreach ($a in $ActiveDirs) { if ($a) { $active += $a.TrimEnd('\').ToLower() } }
+  $hasActiveGit = $false
+  $hasActivePwsh = $false
+  foreach ($a in $ActiveDirs) {
+    if (-not $a) { continue }
+    $k = Get-ManagedKind (Split-Path -Leaf $a)
+    if ($k -eq 'git') { $hasActiveGit = $true }
+    if ($k -eq 'pwsh') { $hasActivePwsh = $true }
+  }
+  $freed = 0
+  $dirsGone = 0
+  $filesGone = 0
+  $children = @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction SilentlyContinue)
+
+  foreach ($d in $children) {
+    if (-not $d.PSIsContainer) { continue }
+    $kind = Get-ManagedKind $d.Name
+    if (-not $kind) { continue }
+    $full = Get-DirectChildOfRoot $d.FullName
+    if (-not $full) { continue }
+    if (-not (Test-ManagedDirExe $kind $full)) { continue }
+    if ($active -contains $full.ToLower()) { Write-Plan ('keep (in use): ' + $full); continue }
+    if ($KeepOldVersions) { Write-Plan ('keep (-KeepOldVersions): ' + $full); continue }
+    $size = 0
+    $sum = Get-ChildItem -LiteralPath $full -Recurse -Force -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+    if ($sum -and $sum.Sum) { $size = $sum.Sum }
+    $mb = [math]::Round($size / 1MB, 1)
+    if ($DryRun -or $ResolveOnly) { Write-Plan ('would delete old version: ' + $full + ' (' + $mb + ' MB)'); continue }
+    if (Remove-OnePath $full -AsDir) {
+      Write-Plan ('deleted old version: ' + $full + ' (' + $mb + ' MB)')
+      $freed = $freed + $size
+      $dirsGone++
+    }
+  }
+
+  foreach ($item in $children) {
+    if ($item.PSIsContainer) { continue }
+    $n = $item.Name
+    $isArchive = ($n.StartsWith('PortableGit-') -and $n.EndsWith('.7z.exe')) -or ($n.StartsWith('PowerShell-') -and $n.EndsWith('.zip'))
+    $isPart = $n.EndsWith('.part')
+    if (-not $isArchive -and -not $isPart) { continue }
+    $full = Get-DirectChildOfRoot $item.FullName
+    if (-not $full) { continue }
+    if ($isArchive) {
+      $dirName = Get-ArchiveTargetDir $n
+      if (-not $dirName) { continue }
+      $kind = Get-ManagedKind $dirName
+      $dirPath = Join-Path $Root $dirName
+      $redundant = (Test-Path -LiteralPath $dirPath) -and (Test-ManagedDirExe $kind $dirPath)
+      if (-not $redundant -and $kind -eq 'git') { $redundant = $hasActiveGit }
+      if (-not $redundant -and $kind -eq 'pwsh') { $redundant = $hasActivePwsh }
+      if (-not $redundant) { Write-Plan ('keep (no extracted copy yet): ' + $full); continue }
+      if ($KeepArchives) { Write-Plan ('keep (-KeepArchives): ' + $full); continue }
+    }
+    $mb = [math]::Round($item.Length / 1MB, 1)
+    if ($DryRun -or $ResolveOnly) { Write-Plan ('would delete: ' + $full + ' (' + $mb + ' MB)'); continue }
+    if (Remove-OnePath $full) {
+      Write-Plan ('deleted: ' + $full + ' (' + $mb + ' MB)')
+      $freed = $freed + $item.Length
+      $filesGone++
+      $okPath = $full + '.ok'
+      if (Test-Path -LiteralPath $okPath) {
+        if (Remove-OnePath $okPath) { $filesGone++ }
+      }
+    }
+  }
+
+  if ($DryRun -or $ResolveOnly) { Write-Plan 'plan only: nothing deleted' }
+  else { Write-Plan ('cleanup: ' + $dirsGone + ' old dir(s), ' + $filesGone + ' file(s), ' + [math]::Round($freed / 1MB, 1) + ' MB freed') }
+}
+
 # ---------------------------------------------------------------------------
 if (-not $ResolveOnly -and -not $DryRun -and -not (Test-Path -LiteralPath $Root)) {
   New-Item -ItemType Directory -Force -Path $Root | Out-Null
@@ -552,7 +695,14 @@ if ($psAsset -and $pwshExe) {
   elseif ($cmp -gt 0) { Write-Plan ('existing pwsh ' + $pwshVer + ' is newer than upstream ' + $psAsset.Version + ': keeping it') }
 }
 
+# Version roots, not PATH entries: cleanup compares directories like git-2.56.1, while the PATH
+# front holds git-2.56.1in. Comparing the wrong level once marked the live install as retired.
+$activeDirs = @()
+if ($bashFinal) { $activeDirs += (Split-Path -Parent (Normalize-ShellDir $bashFinal)) }
+if ($pwshFinal) { $activeDirs += (Split-Path -Parent $pwshFinal) }
+
 if ($ResolveOnly -or $DryRun) {
+  Invoke-Cleanup $activeDirs
   foreach ($o in $offers) { Write-Log ('UPGRADE-OFFER ' + $o.Name + ' ' + $o.Have + ' -> ' + $o.Want) }
   Write-Log ''
   Write-Log ($(if ($ResolveOnly) { 'resolve-only' } else { 'dry-run' }) + ': nothing downloaded, nothing written')
@@ -616,6 +766,9 @@ if ($Launcher) {
   if ($pwshFinal) { $front += (Split-Path -Parent $pwshFinal) }
   Write-Launcher $front
 }
+
+# Runs after extraction and after the PATH write, so a failed install never costs the old copy.
+Invoke-Cleanup $activeDirs
 
 Write-Log ''
 Write-Log '=== phase B: upgrade offer ==='

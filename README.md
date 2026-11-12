@@ -73,11 +73,30 @@ UPGRADE-OFFER pwsh 7.6.9 -> 7.7.0
 - 拿到 GitHub 给出的 `sha256` 摘要时强校验，失败换下一个源；
 - 网络完全不通时不是失败：只用手上的版本，并把上游标成 `unknown`。
 
+## 清理（默认自动，每次运行都做）
+
+| 时机 | 动作 |
+|---|---|
+| 解压成功、PATH 已指向 | 删掉下载的压缩包 + `.ok` 标记 |
+| 升级到新版本（已解压、已指向） | 删掉**旧版本目录** + 压缩包 |
+| 已经是最新（没有更新可做） | 照样执行：把上一次遗留的压缩包删掉 |
+
+**只删自己装的**：范围限定在 `-Root`（默认 `%LOCALAPPDATA%\dsh-tools`）的**直接子项**，且名字必须像脚本产物（`git-<版本>` / `PowerShell-<版本>` / `PortableGit-*.7z.exe` / `PowerShell-*-win-*.zip`）、目录里真有 `bin\bash.exe` 或 `pwsh.exe`、并且**不是当前正在用的那个版本**。你原有的 `C:\Program Files\Git`、别的盘上的 pwsh 都不在范围内。
+
+想留后路就加开关（默认不加 = 全删）：
+
+```powershell
+setup-tools.ps1 -Upgrade -KeepArchives      # 保留下载的压缩包
+setup-tools.ps1 -Upgrade -KeepOldVersions   # 保留旧版本目录
+```
+
+删包之后 `-Offline` 重装和"退回上一版本"需要重新下载（PATH 快照仍可回滚配置）。
+
 ## 它到底改了什么
 
 | 位置 | 改动 | 可逆性 |
 |---|---|---|
-| `%LOCALAPPDATA%\dsh-tools` | 只在"缺"或"升级"时解压 PortableGit / PowerShell 7，目录带版本号 | `restore.ps1 -Uninstall -DeleteTools` |
+| `%LOCALAPPDATA%\dsh-tools` | 只在"缺"或"升级"时解压 PortableGit / PowerShell 7，目录带版本号；解压后删压缩包、升级后删旧版本目录（`-KeepArchives` / `-KeepOldVersions` 可关掉） | `restore.ps1 -Uninstall -DeleteTools` |
 | 用户 PATH | 把选中的目录**提到最前**（并删掉自己装过的过期条目） | `restore.ps1 -RestorePath` |
 | `<DSH home>\profiles\*\cordis.patch.yml` | 追加一段执行器切换条目（`bash-sandbox`） | `restore.ps1` 逐字节还原 |
 | `%LOCALAPPDATA%\dsh-windows-shell\state.json` | 记录"检查过/已提议/已拒绝"的版本 | 删文件 |
@@ -101,7 +120,7 @@ DSH 可执行文件路径是**运行时探测**的（运行中的进程 → 卸�
 
 ## 已验证 / 未验证
 
-- 已验证（本机实测）：探测能识别系统 Git 的 bash 2.56.0 与 pwsh 7.6.9，正确给出 `UPGRADE-OFFER` 且不下载；`-DryRun` 不改 PATH、不建目录；镜像测速真实选中 `gh-proxy.com` 并完成下载；sha256 校验、验签、解压后 smoke test 通过；`restore.ps1` 快照 6 个文件、`-DryRun` 全部 SAME、`-Uninstall -DryRun` 只比对不写盘；`restart-dsh.ps1 -ResolveOnly` 与 `restart-dsh.cmd -ResolveOnly`（参数转发）都能解析到真实 exe；全部脚本纯 ASCII、在 Windows PowerShell 5.1 下跑通。
+- 已验证（本机实测）：探测能识别系统 Git 的 bash 2.56.0 与 pwsh 7.6.9，正确给出 `UPGRADE-OFFER` 且不下载；真实升级后再跑一次会走"已最新"分支并把遗留压缩包删掉（实测 167.3 MB，780→613 MB，正在使用的目录与诱饵目录均未受影响）；`-DryRun` 不改 PATH、不建目录；镜像测速真实选中 `gh-proxy.com` 并完成下载；sha256 校验、验签、解压后 smoke test 通过；`restore.ps1` 快照 6 个文件、`-DryRun` 全部 SAME、`-Uninstall -DryRun` 只比对不写盘；`restart-dsh.ps1 -ResolveOnly` 与 `restart-dsh.cmd -ResolveOnly`（参数转发）都能解析到真实 exe；全部脚本纯 ASCII、在 Windows PowerShell 5.1 下跑通。
 - 未验证：全新无 Git / 无 PS7 机器上的首次安装（路径分支存在但未实跑）；`bash-sandbox` 在 read-only / workspace-write 档下的沙箱 runner 在 Windows 上能否启动；`-AskUpgrade` 在无控制台时的实际交互（逻辑已按"跳过"处理）。
 
 ## English summary

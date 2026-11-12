@@ -128,10 +128,19 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
 | 文件 | 作用 |
 |---|---|
 | `SKILL.md` | 执行源，即本文 |
-| `scripts/setup-tools.ps1` | 探测 → 决定用现有的还是装新的 → 测速选源 → 下载（sha256 校验）→ 解压 → 验签 → 前置用户 PATH → 记录升级提议 |
+| `scripts/setup-tools.ps1` | 探测 → 决定用现有的还是装新的 → 测速选源 → 下载（sha256 校验）→ 解压 → 验签 → 前置用户 PATH → 清理 → 记录升级提议 |
 | `scripts/restore.ps1` | 快照、dry-run 比对、逐字节还原配置、还原用户 PATH、卸载、重启 DSH |
 | `scripts/restart-dsh.ps1` | 重启 DSH，让新 PATH 生效；DSH 路径运行时探测 |
 | `scripts/restart-dsh.cmd` | 上面那个的双击入口，转发参数 |
+
+### 清理（每次运行都执行，包含"已是最新"的空跑）
+
+- 解压成功并写入 PATH 后，删掉下载的压缩包和 `.ok` 标记
+- 升级到新版本后（新版本已解压 + 已指向），删掉旧版本目录
+- 只处理 `-Root` 的**直接子项**，且必须长得像脚本自己装的东西：名字是 `git-<版本>` / `PowerShell-<版本>` / `PortableGit-*.7z.exe` / `PowerShell-*-win-*.zip`，目录里真的有 `bin\bash.exe` 或 `pwsh.exe`，并且**不是当前正在用的那个版本**
+- 用户原有的东西（`C:\Program Files\Git`、别的盘上的 pwsh）不在 `-Root` 下，扫不到也删不到
+- 删除失败（文件被占用/杀软拦截）只报告，下次运行会再试
+- 逃生口：`-KeepArchives` 保留压缩包、`-KeepOldVersions` 保留旧版本目录；两个都不加就是全删
 
 ### 镜像（自动）
 
@@ -157,6 +166,8 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
 | `-Launcher` | 关 | 生成 `<Root>\launch-dsh.cmd` |
 | `-Offline` | 关 | 不联网，只用 `-Root` 下的现成包 |
 | `-SkipGit` / `-SkipPs7` / `-SkipPath` | 关 | 拆步执行 |
+| `-KeepArchives` | 关 | 保留下载的压缩包（默认解压后删） |
+| `-KeepOldVersions` | 关 | 保留旧版本目录（默认升级后删） |
 | `-ProbeTimeoutSec` | 25 | API 请求超时 |
 
 架构自动识别：ARM64 取 arm64 资产，其余 x64。
