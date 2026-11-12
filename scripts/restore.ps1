@@ -27,7 +27,8 @@ param(
   [string[]]$Profiles,
   [string]$Extra = '',
   [string]$DshExe,
-  [string]$ToolsRoot
+  [string]$ToolsRoot,
+  [int]$KeepPrevs = 2
 )
 
 $ErrorActionPreference = 'Stop'
@@ -95,9 +96,23 @@ function Get-Sha([string]$p) { if (Test-Path -LiteralPath $p) { (Get-FileHash -L
 
 if ($Snapshot) {
   if (Test-Path -LiteralPath $backupDir) {
+    # Two snapshots inside one second used to collide and abort the second one.
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    Rename-Item -LiteralPath $backupDir -NewName ('backup.prev-' + $stamp)
-    Write-Host ('previous snapshot -> backup.prev-' + $stamp)
+    $name = 'backup.prev-' + $stamp
+    $n = 1
+    while (Test-Path -LiteralPath (Join-Path $StateDir $name)) { $n++; $name = 'backup.prev-' + $stamp + '-' + $n }
+    Rename-Item -LiteralPath $backupDir -NewName $name
+    Write-Host ('previous snapshot -> ' + $name)
+    # Keep at most $KeepPrevs previous snapshots; the rest are never read by any code path.
+    $prevs = @(Get-ChildItem -LiteralPath $StateDir -Force -ErrorAction SilentlyContinue |
+      Where-Object { $_.PSIsContainer -and $_.Name -like 'backup.prev-*' } |
+      Sort-Object LastWriteTime -Descending)
+    $drop = @()
+    if ($KeepPrevs -ge 0) { for ($i = $KeepPrevs; $i -lt $prevs.Count; $i++) { $drop += $prevs[$i] } }
+    foreach ($d in $drop) {
+      Remove-Item -LiteralPath $d.FullName -Recurse -Force -ErrorAction SilentlyContinue
+      Write-Host ('pruned old snapshot: ' + $d.Name)
+    }
   }
   New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
   $entries = @()
@@ -138,6 +153,15 @@ if ($doPath) {
     if ([Environment]::GetEnvironmentVariable('Path', 'User') -eq $meta.UserPath) { Write-Host 'USER Path restored.' }
     else { Write-Host '!! USER Path restore failed.'; $fail++ }
   }
+}
+
+$changedNow = @($meta.Files | Where-Object { (Get-Sha $_.Source) -ne $_.Sha256 })
+if ($changedNow.Count -gt 0 -and -not $DryRun) {
+  Write-Host ''
+  Write-Host ('WARNING: ' + $changedNow.Count + ' file(s) changed after the snapshot; restoring replaces their current content:')
+  foreach ($f in $changedNow) { Write-Host ('  - ' + $f.Source) }
+  Write-Host '  (run with -DryRun to inspect first, or copy them elsewhere)'
+  Write-Host ''
 }
 
 foreach ($f in $meta.Files) {

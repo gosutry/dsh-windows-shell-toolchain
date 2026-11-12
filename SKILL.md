@@ -95,7 +95,16 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
       config:
         cwd: '<workspace>'
 
-写完先解析校验 YAML 再落盘。
+这一段现在**由脚本落地，不要再手写 YAML**：
+
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup-tools.ps1 -PatchProfile -DryRun   # 先看会改哪个文件
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup-tools.ps1 -PatchProfile          # 真正写入
+
+- 自动发现 `<DSH home>\profiles\*` 下已有 `cordis.patch.yml` 的 profile；`-Profile desktop` 可指定
+- 用标记注释定位，**整块幂等替换**，标记以上的内容一个字不动（重复运行只会打印 "already patched"）
+- 写前备份成 `cordis.patch.yml.bak-<时间>`；写后读回逐字比对
+- PS 5.1 没有 YAML 解析器，落盘前做结构校验：无 tab、四个 id 各出现一次、每行只能是注释/列表项/缩进续行
+- `cwd` 默认取当前目录，可用 `-Workspace` 指定；不写 BOM（避免 5.1 按 ANSI 读成乱码）
 
 `tool-pwsh` 那条 `disabled: true` 只关掉 bundle 层那份，每个预设自己也挂了一份，profile patch 够不到——所以 `pwsh` 工具仍会出现在工具表里。用 `bash` 工具，需要 PowerShell 时显式调 `pwsh -NoProfile -Command '...'`。
 
@@ -168,9 +177,21 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
 | `-SkipGit` / `-SkipPs7` / `-SkipPath` | 关 | 拆步执行 |
 | `-KeepArchives` | 关 | 保留下载的压缩包（默认解压后删） |
 | `-KeepOldVersions` | 关 | 保留旧版本目录（默认升级后删） |
+| `-PatchProfile` | 关 | 写入/刷新 profile 的 `cordis.patch.yml`（备份 + 幂等 + 结构校验） |
+| `-Profile` | 全部 | `-PatchProfile` 时只处理这些 profile，逗号分隔 |
+| `-Workspace` | 当前目录 | 写进 bash-sandbox 块的 `cwd` |
+| `-DshHome` | `%USERPROFILE%\.dsh` | `-PatchProfile` 时 profile 所在的 DSH 主目录 |
 | `-ProbeTimeoutSec` | 25 | API 请求超时 |
 
-架构自动识别：ARM64 取 arm64 资产，其余 x64。
+架构按 **OS 架构**判断（不是进程位数；32 位进程跑在 64 位系统上也能选对）：
+
+| OS 架构 | 资产 | 说明 |
+|---|---|---|
+| `x64` | `PortableGit-<v>-64-bit.7z.exe` / `PowerShell-<v>-win-x64.zip` | 最新版直接可用 |
+| `ARM64` | `PortableGit-<v>-arm64.7z.exe` / `PowerShell-<v>-win-arm64.zip` | 最新版直接可用 |
+| `x86` | Git 最新版**已停发** 32 位 PortableGit；pwsh 仍有 `win-x86` | 脚本分页回溯到该架构最后一个有包的稳定版（当前 `v2.50.1`），并打印实际用的 tag |
+
+回溯只用于 `latest`：显式 `-GitVersion` / `-Ps7Version` 不回退，缺包直接报错；回溯跳过 prerelease。
 
 ### 参数（restore.ps1）
 
@@ -188,12 +209,15 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
 | `-DshExe` | 自动探测 | 覆盖 DSH 可执行文件路径 |
 | `-ToolsRoot` | `%LOCALAPPDATA%\dsh-tools` | 卸载时处理的工具目录 |
 | `-StateDir` | `%LOCALAPPDATA%\dsh-windows-shell` | 快照存放目录 |
+| `-KeepPrevs` | 2 | 保留最近几份旧快照；更旧的在下一次快照时删除 |
 
 DSH 路径探测顺序：正在运行的进程 → 卸载注册表项 → 开始菜单快捷方式 → 默认安装位置 → 报错并提示 `-DshExe`。
 
 ### 回滚与卸载
 
 **可回滚至技能改动配置之前**（范围见下表）。要回到"没装过"的状态用 `-Uninstall -DeleteTools`。
+
+注意：`restore.ps1` 是**整文件覆盖**。快照之后你对这些文件做的改动都会被丢掉，脚本会在动手前先把"将被替换"的文件清单打印出来。
 
     scripts\restore.ps1 -DryRun          # 只看差异，不写盘
     scripts\restore.ps1                  # 逐字节还原配置

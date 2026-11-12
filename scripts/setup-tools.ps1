@@ -27,6 +27,13 @@
     -SkipPath / -SkipGit / -SkipPs7
     -KeepArchives    keep downloaded archives (default: delete them once extracted and on PATH)
     -KeepOldVersions keep retired version directories (default: delete them after an upgrade)
+    -PatchProfile    write or refresh the shell-executor block in every profile's
+                     cordis.patch.yml (backup first, idempotent, shape-validated);
+                     -DryRun previews it without writing
+    -Profile NAMES   comma-separated profile names to patch (default: every profile that
+                     already has a cordis.patch.yml)
+    -Workspace PATH  cwd recorded in the bash-sandbox block (default: current directory)
+    -DshHome DIR     DSH home that holds profiles/ (default: DSH_HOME or %USERPROFILE%\.dsh)
 
   Cleanup runs on every invocation, including the no-op case where the machine is already
   current: leftover archives from an earlier run are removed then. Only direct children of
@@ -51,6 +58,10 @@ param(
   [switch]$SkipPs7,
   [switch]$KeepArchives,
   [switch]$KeepOldVersions,
+  [switch]$PatchProfile,
+  [string]$Profile = '',
+  [string]$Workspace = '',
+  [string]$DshHome = '',
   [int]$ProbeTimeoutSec = 25
 )
 
@@ -58,11 +69,40 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
+# Rule 2 of this skill is "scripts are pure ASCII", and a stray 0x08 byte had already slipped
+# into a comment. Check the file itself instead of trusting the rule.
+function Test-SelfAscii([string]$Path) {
+  if (-not $Path -or -not (Test-Path -LiteralPath $Path)) { return @() }
+  $bytes = [System.IO.File]::ReadAllBytes($Path)
+  $bad = @()
+  for ($i = 0; $i -lt $bytes.Length; $i++) {
+    $x = $bytes[$i]
+    if ($x -eq 9 -or $x -eq 10 -or $x -eq 13) { continue }
+    if ($x -lt 32 -or $x -gt 126) { $bad += $i }
+  }
+  return $bad
+}
+$selfBad = @(Test-SelfAscii $PSCommandPath)
+if ($selfBad.Count -gt 0) {
+  Write-Host ('WARNING: ' + $selfBad.Count + ' non-ASCII/control byte(s) in this script, first at offset ' + $selfBad[0] + ' (see SKILL.md rule 2)')
+}
+
 if (-not $Root) { $Root = Join-Path $env:LOCALAPPDATA 'dsh-tools' }
 if (-not $StateDir) { $StateDir = Join-Path $env:LOCALAPPDATA 'dsh-windows-shell' }
 $Root = $Root.TrimEnd('\')
 
-$arch = if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') { 'arm64' } else { 'x64' }
+# PROCESSOR_ARCHITECTURE is this process's bitness, not the machine's: a 32-bit process on a
+# 64-bit OS reports x86 and keeps the OS arch in PROCESSOR_ARCHITEW6432. Read the OS arch, so
+# a 32-bit host still gets the 32-bit toolchain instead of a 64-bit one it cannot run.
+function Get-OsArch {
+  $pa = $env:PROCESSOR_ARCHITECTURE
+  if ($env:PROCESSOR_ARCHITEW6432) { $pa = $env:PROCESSOR_ARCHITEW6432 }
+  if ($pa -eq 'ARM64') { return 'arm64' }
+  if ($pa -eq 'x86') { return 'x86' }
+  return 'x64'
+}
+
+$arch = Get-OsArch
 
 # Built-in mirrors, probed in parallel-ish (HEAD, short timeouts) and used fastest-first.
 # Asset mirrors also proxy github.com release downloads; API mirrors must proxy api.github.com,
@@ -97,6 +137,12 @@ function ConvertTo-Ver([string]$Text) {
   try { return [version]($nums -join '.') } catch { return $null }
 }
 
+# A prerelease shares its numeric core with the plain release, so 7.7.0-rc1 must compare
+# below 7.7.0: comparing numbers alone reports them as equal and hides a real upgrade.
+function Test-PreRelease([string]$Text) {
+  return ($Text -match '-[A-Za-z]')
+}
+
 # -1 = have is older, 0 = same, 1 = have is newer, -9 = cannot tell
 function Compare-Ver([string]$Have, [string]$Want) {
   $h = ConvertTo-Ver $Have
@@ -105,6 +151,20 @@ function Compare-Ver([string]$Have, [string]$Want) {
   if ($null -eq $h) { return -1 }
   if ($h -gt $w) { return 1 }
   if ($h -lt $w) { return -1 }
+  $hp = Test-PreRelease $Have
+  $wp = Test-PreRelease $Want
+  if ($wp -and -not $hp) { return 1 }
+  if ($hp -and -not $wp) { return -1 }
+  if ($hp -and $wp) {
+    $hs = ($Have -replace '.*[-]', '')
+    $ws = ($Want -replace '.*[-]', '')
+    $hn = 0
+    $wn = 0
+    if ($hs -match '(\d+)$') { $hn = [int]$matches[1] }
+    if ($ws -match '(\d+)$') { $wn = [int]$matches[1] }
+    if ($hn -gt $wn) { return 1 }
+    if ($hn -lt $wn) { return -1 }
+  }
   return 0
 }
 
@@ -157,7 +217,23 @@ function Test-WslBashPresent {
 # Network -------------------------------------------------------------------
 function Test-Head([string]$Url) {
   $bad = [pscustomobject]@{ Ok = $false; Ms = 600000 }
-  if (-not $HaveCurl) { return $bad }
+  if (-not $HaveCurl) {
+    # Without curl the mirror candidates used to be dropped silently, leaving only the
+    # origin - which is the one address that is blocked on the networks this list exists
+    # for. Fall back to a .NET HEAD request so mirrors stay usable without curl.
+    try {
+      $sw = [Diagnostics.Stopwatch]::StartNew()
+      $req = [Net.WebRequest]::Create($Url)
+      $req.Method = 'HEAD'
+      $req.Timeout = 8000
+      $resp = $req.GetResponse()
+      $code = [int]$resp.StatusCode
+      $resp.Close()
+      $sw.Stop()
+      if ($code -ge 200 -and $code -lt 400) { return [pscustomobject]@{ Ok = $true; Ms = [int]$sw.ElapsedMilliseconds } }
+    } catch { }
+    return $bad
+  }
   $out = & curl.exe -sS -I -L -o NUL --connect-timeout 6 --max-time 12 -w '%{http_code} %{time_total}' $Url 2>$null
   if ($LASTEXITCODE -ne 0 -or -not $out) { return $bad }
   $parts = @(($out -join ' ').Trim() -split '\s+')
@@ -252,11 +328,32 @@ function Resolve-Asset([string]$Repo, [string]$Version, [string]$Pattern) {
   }
   if (-not $rel) { return $null }
   $asset = $rel.assets | Where-Object { $_.name -match $Pattern } | Select-Object -First 1
+  if (-not $asset -and $Version -eq 'latest') {
+    # Upstream can drop an architecture from the newest release: Git for Windows stopped
+    # publishing 32-bit PortableGit after v2.48.1. Walk recent releases and use the newest one
+    # that still ships this architecture instead of declaring it unsupported.
+    # Newest first, paged: one page of 100 releases does not always reach far enough back
+    # (Git for Windows' 32-bit build is several minor versions behind the newest release).
+    for ($page = 1; $page -le 3 -and -not $asset; $page++) {
+      $list = Get-ApiJson ('https://api.github.com/repos/' + $Repo + '/releases?per_page=100&page=' + $page)
+      $items = @($list)
+      if ($items.Count -eq 0) { break }
+      foreach ($r in $items) {
+        if ($r.prerelease -eq $true) { continue }
+        $a = $r.assets | Where-Object { $_.name -match $Pattern } | Select-Object -First 1
+        if ($a) { $asset = $a; $rel = $r; break }
+      }
+      if ($items.Count -lt 100) { break }
+    }
+    if ($asset) { Write-Plan ('no ' + $arch + ' asset in the newest release: using ' + $rel.tag_name) }
+  }
   if (-not $asset) { throw ('no asset matching ' + $Pattern + ' in release ' + $rel.tag_name) }
   $ver = $asset.name
   $ver = $ver -replace '^[A-Za-z]+-', ''
-  $ver = $ver -replace '-(64-bit|arm64).*$', ''
+  # Platform suffix first: the ARM64 asset is PowerShell-<v>-win-arm64.zip, and removing
+  # '-arm64.*' first would leave '<v>-win' (a directory named PowerShell-<v>-win).
   $ver = $ver -replace '-win-.*$', ''
+  $ver = $ver -replace '-(64-bit|arm64|32-bit).*$', ''
   $digest = $null
   if ($asset.PSObject.Properties.Name -contains 'digest' -and $asset.digest) {
     $digest = ($asset.digest -replace '^sha256:', '').ToLower()
@@ -435,6 +532,98 @@ function Write-Launcher([string[]]$Dirs) {
   Write-Log 'Use it to start DSH when a WSL bash.exe sits in System32; a user PATH entry cannot outrank it.'
 }
 
+# Profile patch (SKILL.md section 7) ----------------------------------------
+# The one step that used to be a hand-written YAML edit. The block is idempotent: it is
+# replaced wherever its marker already exists, so re-running never stacks duplicates.
+$PatchMarker = '# ===== shell toolchain: bash executor (sandboxing variant) ====='
+
+function New-PatchBlock([string]$WorkspacePath) {
+  @(
+    $PatchMarker,
+    '# Written by setup-tools.ps1 -PatchProfile. Re-running replaces this block;',
+    '# everything above the marker is left untouched.',
+    '- id: tool-bash',
+    "  name: '@deepseek-ai/dsh-tool-bash'",
+    '  disabled: false',
+    '- id: tool-pwsh',
+    "  name: '@deepseek-ai/dsh-tool-pwsh'",
+    '  disabled: true',
+    '- id: pwsh-sandbox',
+    "  name: '@deepseek-ai/dsh-pwsh-sandbox'",
+    '  disabled: true',
+    '- id: bash-sandbox',
+    "  name: '@deepseek-ai/dsh-bash-sandbox'",
+    '  disabled: false',
+    '  config:',
+    ("    cwd: '" + $WorkspacePath + "'"),
+    '    timeoutMs: 120000',
+    '    maxTimeoutMs: 600000',
+    ''
+  )
+}
+
+# PowerShell 5.1 has no YAML parser, so validate the shape this file must keep: the four ids
+# exactly once, no tabs, and every line a comment, a list item or an indented continuation.
+function Test-PatchText([string]$Text) {
+  $problems = @()
+  if ($Text.IndexOf([char]9) -ge 0) { $problems += 'contains a tab character' }
+  foreach ($id in @('tool-bash', 'tool-pwsh', 'pwsh-sandbox', 'bash-sandbox')) {
+    $c = ([regex]::Matches($Text, ('(?m)^- id: ' + [regex]::Escape($id) + '\s*$'))).Count
+    if ($c -ne 1) { $problems += ('entry "' + $id + '" appears ' + $c + ' time(s), expected exactly 1') }
+  }
+  $n = 0
+  foreach ($ln in ($Text -split [string][char]10)) {
+    $n++
+    if ($ln.Trim() -eq '') { continue }
+    if ($ln -match '^#') { continue }
+    if ($ln -match '^- ') { continue }
+    if ($ln -match '^  ') { continue }
+    $problems += ('line ' + $n + ' is not a comment, list item or indented continuation: ' + $ln)
+  }
+  return $problems
+}
+
+function Invoke-ProfilePatch {
+  $homeDir = if ($DshHome) { $DshHome } elseif ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
+  $ws = if ($Workspace) { $Workspace } else { (Get-Location).Path }
+  if ($ws -match "'") { throw ('workspace path contains a single quote, which this writer cannot quote safely: ' + $ws) }
+  $profilesRoot = Join-Path $homeDir 'profiles'
+  if (-not (Test-Path -LiteralPath $profilesRoot)) { throw ('no profiles directory at ' + $profilesRoot + ' - pass -DshHome') }
+  Write-Log ''
+  Write-Log '=== profile patch ==='
+  $wanted = @()
+  if ($Profile) { $wanted = @($Profile -split ',' | ForEach-Object { $_.Trim() }) }
+  $files = @()
+  foreach ($d in @(Get-ChildItem -LiteralPath $profilesRoot -Directory -ErrorAction SilentlyContinue)) {
+    if ($wanted.Count -gt 0 -and ($wanted -notcontains $d.Name)) { continue }
+    $p = Join-Path $d.FullName 'cordis.patch.yml'
+    if ((Test-Path -LiteralPath $p) -or ($wanted -contains $d.Name)) { $files += $p }
+  }
+  if ($files.Count -eq 0) { Write-Plan 'no cordis.patch.yml found; nothing patched'; return }
+  $block = (New-PatchBlock $ws) -join [string][char]13 + [string][char]10
+  foreach ($f in $files) {
+    $old = ''
+    if (Test-Path -LiteralPath $f) { $old = [System.IO.File]::ReadAllText($f) }
+    $idx = $old.IndexOf($PatchMarker)
+    $head = if ($idx -ge 0) { $old.Substring(0, $idx) } else { $old }
+    $head = $head.TrimEnd() + [string][char]13 + [string][char]10 + [string][char]13 + [string][char]10
+    $new = $head + $block
+    $problems = @(Test-PatchText $new)
+    if ($problems.Count -gt 0) {
+      Write-Plan ('rejected, current file left alone: ' + $f)
+      foreach ($x in $problems) { Write-Plan ('  - ' + $x) }
+      continue
+    }
+    if ($old -eq $new) { Write-Plan ('already patched, unchanged: ' + $f); continue }
+    if ($DryRun -or $ResolveOnly) { Write-Plan ('would patch: ' + $f + ' (cwd ' + $ws + ')'); continue }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    if (Test-Path -LiteralPath $f) { Copy-Item -LiteralPath $f -Destination ($f + '.bak-' + $stamp) -Force }
+    [System.IO.File]::WriteAllText($f, $new, (New-Object System.Text.UTF8Encoding($false)))
+    if ([System.IO.File]::ReadAllText($f) -ne $new) { throw ('patch write did not take effect: ' + $f) }
+    Write-Log ('  patched: ' + $f)
+  }
+}
+
 # Cleanup -------------------------------------------------------------------
 # Deletes only what this script installed: direct children of -Root that carry the shapes it
 # creates. Anything the user already had on the machine lives outside -Root and is never in scope.
@@ -468,6 +657,7 @@ function Get-ArchiveTargetDir([string]$Name) {
     $rest = $Name.Substring(12)
     $i = $rest.IndexOf('-64-bit')
     if ($i -lt 0) { $i = $rest.IndexOf('-arm64') }
+    if ($i -lt 0) { $i = $rest.IndexOf('-32-bit') }
     if ($i -gt 0) { return 'git-' + $rest.Substring(0, $i) }
     return ''
   }
@@ -624,12 +814,14 @@ $gitAsset = $null
 $psAsset = $null
 if (-not $Offline) {
   if (-not $SkipGit) {
-    $gitPat = 'PortableGit-[\d.]+-' + $(if ($arch -eq 'arm64') { 'arm64' } else { '64-bit' }) + '\.7z\.exe$'
+    $gitTag = if ($arch -eq 'arm64') { 'arm64' } elseif ($arch -eq 'x86') { '32-bit' } else { '64-bit' }
+    $gitPat = 'PortableGit-[\d.]+-' + $gitTag + '\.7z\.exe$'
     $gitAsset = Resolve-Asset 'git-for-windows/git' $GitVersion $gitPat
     if ($gitAsset) { Write-Log ('  git latest: ' + $gitAsset.Version) } else { Write-Log '  git latest: unknown (network unavailable)' }
   }
   if (-not $SkipPs7) {
-    $psPat = 'PowerShell-[\d.]+-win-' + $arch + '\.zip$'
+    $psTag = if ($arch -eq 'x86') { 'x86' } else { $arch }
+    $psPat = 'PowerShell-[\d.]+-win-' + $psTag + '\.zip$'
     $psAsset = Resolve-Asset 'PowerShell/PowerShell' $Ps7Version $psPat
     if ($psAsset) { Write-Log ('  pwsh latest: ' + $psAsset.Version) } else { Write-Log '  pwsh latest: unknown (network unavailable)' }
   }
@@ -696,10 +888,12 @@ if ($psAsset -and $pwshExe) {
 }
 
 # Version roots, not PATH entries: cleanup compares directories like git-2.56.1, while the PATH
-# front holds git-2.56.1in. Comparing the wrong level once marked the live install as retired.
+# front holds git-2.56.1\bin. Comparing the wrong level once marked the live install as retired.
 $activeDirs = @()
 if ($bashFinal) { $activeDirs += (Split-Path -Parent (Normalize-ShellDir $bashFinal)) }
 if ($pwshFinal) { $activeDirs += (Split-Path -Parent $pwshFinal) }
+
+if ($PatchProfile) { Invoke-ProfilePatch }
 
 if ($ResolveOnly -or $DryRun) {
   Invoke-Cleanup $activeDirs
@@ -788,5 +982,6 @@ if ($state) {
 }
 
 Write-Log ''
-Write-Log ('DONE. wrote=' + $Wrote + '. Next: apply the DSH profile patch (SKILL.md section 7), then restart DSH.')
+if ($PatchProfile) { Write-Log ('DONE. wrote=' + $Wrote + '. Profile patch handled; restart DSH to apply it.') }
+else { Write-Log ('DONE. wrote=' + $Wrote + '. Next: apply the DSH profile patch (SKILL.md section 7), then restart DSH.') }
 if (-not $Wrote -and $offers.Count -eq 0) { Write-Log 'Nothing needed changing on this machine.' }
