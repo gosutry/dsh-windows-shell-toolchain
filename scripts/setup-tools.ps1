@@ -309,11 +309,19 @@ function Get-ApiJson([string]$Url) {
   $order += ''
   foreach ($m in $order) {
     $u = if ($m -eq '') { $Url } else { $m + $Url }
-    try {
-      return Invoke-RestMethod -Uri $u -UseBasicParsing -Headers $Headers -TimeoutSec $ProbeTimeoutSec
-    } catch {
-      Write-Plan ('api unreachable via ' + (Get-Label $m) + ': ' + $_.Exception.Message)
+    # A single transient reset used to abort the whole run: one dropped connection while
+    # listing releases is enough to lose the architecture fallback. Retry the same source
+    # before moving to the next candidate, and keep the last error for the final message.
+    $last = ''
+    for ($try = 1; $try -le 3; $try++) {
+      try {
+        return Invoke-RestMethod -Uri $u -UseBasicParsing -Headers $Headers -TimeoutSec $ProbeTimeoutSec
+      } catch {
+        $last = $_.Exception.Message
+        if ($try -lt 3) { Start-Sleep -Seconds (2 * $try) }
+      }
     }
+    Write-Plan ('api unreachable via ' + (Get-Label $m) + ' after 3 tries: ' + $last)
   }
   return $null
 }
