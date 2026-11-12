@@ -1,0 +1,7 @@
+{
+  "name": "dsh-windows-shell-toolchain",
+  "version": "1.1.0",
+  "private": true,
+  "description": "DSH Windows shell toolchain: real bash via PortableGit plus a portable PowerShell 7, preferring what the machine already has.",
+  "license": "MIT"
+}

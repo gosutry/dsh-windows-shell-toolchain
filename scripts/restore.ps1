@@ -1,6 +1,6 @@
 <#
-  restore.ps1 - snapshot and byte-exact restore of DSH profile config files.
-  Targets are auto-discovered under <DSH home>\profiles\*; override with -Profiles.
+  restore.ps1 - snapshot and byte-exact restore of DSH profile config files, plus rollback
+  of the user PATH change made by setup-tools.ps1. ASCII only.
 
   Usage:
     restore.ps1 -Snapshot            create a snapshot (do this BEFORE any change)
@@ -8,6 +8,11 @@
     restore.ps1                      restore files from the snapshot
     restore.ps1 -RestorePath         also restore the USER Path environment variable
     restore.ps1 -Restart             restore, then restart DSH
+    restore.ps1 -Uninstall           restore config + user PATH, print what is left to remove
+    restore.ps1 -Uninstall -DeleteTools   also delete the managed tool directories
+
+  The DSH executable is discovered at run time (running process -> uninstall registry entry ->
+  Start Menu shortcut -> default install path), so it works on any user name or install drive.
 #>
 [CmdletBinding()]
 param(
@@ -15,17 +20,61 @@ param(
   [switch]$DryRun,
   [switch]$RestorePath,
   [switch]$Restart,
+  [switch]$Uninstall,
+  [switch]$DeleteTools,
   [string]$StateDir,
   [string]$DshHome,
   [string[]]$Profiles,
-  [string]$Extra = ''
+  [string]$Extra = '',
+  [string]$DshExe,
+  [string]$ToolsRoot
 )
 
 $ErrorActionPreference = 'Stop'
 if (-not $StateDir) { $StateDir = Join-Path $env:LOCALAPPDATA 'dsh-windows-shell' }
+if (-not $ToolsRoot) { $ToolsRoot = Join-Path $env:LOCALAPPDATA 'dsh-tools' }
 if (-not $DshHome) { if ($env:DSH_HOME) { $DshHome = $env:DSH_HOME } else { $DshHome = Join-Path $env:USERPROFILE '.dsh' } }
 $backupDir = Join-Path $StateDir 'backup'
 $manifest = Join-Path $backupDir 'manifest.json'
+
+function Resolve-DshExe {
+  param([string]$Override)
+  if ($Override) {
+    if (Test-Path -LiteralPath $Override) { return $Override }
+    throw ('DSH exe not found at -DshExe ' + $Override)
+  }
+  $p = Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue |
+    Where-Object { try { $null -ne $_.Path } catch { $false } } | Select-Object -First 1
+  if ($p) { return $p.Path }
+
+  foreach ($k in @(
+      'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+      'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+      'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')) {
+    $e = Get-ItemProperty $k -ErrorAction SilentlyContinue |
+      Where-Object { $_.DisplayName -like '*DeepSeek*' } | Select-Object -First 1
+    if ($e) {
+      $cand = $null
+      if ($e.InstallLocation) { $cand = Join-Path $e.InstallLocation 'DeepSeek Harness.exe' }
+      if ((-not $cand -or -not (Test-Path -LiteralPath $cand)) -and $e.DisplayIcon) {
+        $cand = ($e.DisplayIcon -split ',')[0].Trim('"')
+      }
+      if ($cand -and (Test-Path -LiteralPath $cand)) { return $cand }
+    }
+  }
+
+  foreach ($root in @($env:APPDATA, $env:ProgramData)) {
+    $lnk = Join-Path $root 'Microsoft\Windows\Start Menu\Programs\DeepSeek Harness.lnk'
+    if (Test-Path -LiteralPath $lnk) {
+      $t = (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath
+      if ($t -and (Test-Path -LiteralPath $t)) { return $t }
+    }
+  }
+
+  $def = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe'
+  if (Test-Path -LiteralPath $def) { return $def }
+  throw 'DSH exe not found (process, registry, shortcut, default path). Pass -DshExe <path>.'
+}
 
 $profileRoot = Join-Path $DshHome 'profiles'
 $names = @()
@@ -79,7 +128,8 @@ if (-not (Test-Path -LiteralPath $manifest)) { throw ('no snapshot at ' + $manif
 $meta = Get-Content -LiteralPath $manifest -Raw -Encoding UTF8 | ConvertFrom-Json
 
 $fail = 0
-if ($RestorePath) {
+$doPath = $RestorePath -or $Uninstall
+if ($doPath) {
   $cur = [Environment]::GetEnvironmentVariable('Path', 'User')
   if ($DryRun) { Write-Host ('USER Path current : ' + $cur); Write-Host ('USER Path snapshot: ' + $meta.UserPath) }
   elseif ($cur -eq $meta.UserPath) { Write-Host 'USER Path already matches snapshot.' }
@@ -105,11 +155,38 @@ if ($DryRun) { Write-Host 'DryRun finished, nothing written.'; if ($fail) { exit
 if ($fail -gt 0) { Write-Host ('failures: ' + $fail); exit 1 }
 Write-Host 'Restore complete, all hashes verified.'
 
+if ($Uninstall) {
+  Write-Host ''
+  Write-Host '=== uninstall ==='
+  if (-not (Test-Path -LiteralPath $ToolsRoot)) {
+    Write-Host ('tool directory already absent: ' + $ToolsRoot)
+  } else {
+    $items = @(Get-ChildItem -LiteralPath $ToolsRoot | Select-Object -ExpandProperty FullName)
+    Write-Host ('tool directory: ' + $ToolsRoot)
+    foreach ($it in $items) { Write-Host ('  ' + $it) }
+    if (-not $DeleteTools) {
+      Write-Host 'Left in place. Re-run with -DeleteTools to remove the directory above.'
+    } else {
+      $resolved = (Resolve-Path -LiteralPath $ToolsRoot).Path.TrimEnd('\')
+      $allowed = @(
+        (Join-Path $env:LOCALAPPDATA 'dsh-tools').TrimEnd('\'),
+        $ToolsRoot.TrimEnd('\'))
+      if ($allowed -notcontains $resolved) { throw ('refusing to delete unexpected path: ' + $resolved) }
+      Write-Host ('deleting ' + $resolved)
+      Remove-Item -LiteralPath $resolved -Recurse -Force
+      if (Test-Path -LiteralPath $resolved) { throw ('delete failed: ' + $resolved) }
+      Write-Host 'deleted.'
+    }
+  }
+  Write-Host 'Restart DSH so the restored PATH and profile take effect.'
+}
+
 if ($Restart) {
-  $exe = Join-Path $env:LOCALAPPDATA 'Programs\DeepSeek Harness\DeepSeek Harness.exe'
+  $exe = Resolve-DshExe -Override $DshExe
+  Write-Host ('DSH exe: ' + $exe)
   $running = Get-Process -Name 'DeepSeek Harness' -ErrorAction SilentlyContinue
   if ($running) { Write-Host 'stopping DSH...'; $running | Stop-Process -Force; Start-Sleep -Seconds 4 }
-  if (Test-Path -LiteralPath $exe) { Start-Process -FilePath $exe; Write-Host 'started.' }
-  else { Write-Host ('!! DSH exe not found at ' + $exe + ' - start it manually') }
+  Start-Process -FilePath $exe
+  Write-Host 'started.'
 }
 exit 0
