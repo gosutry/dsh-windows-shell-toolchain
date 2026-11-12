@@ -193,6 +193,8 @@ DSH 路径探测顺序：正在运行的进程 → 卸载注册表项 → 开始
 
 ### 回滚与卸载
 
+**可回滚至技能改动配置之前**（范围见下表）。要回到"没装过"的状态用 `-Uninstall -DeleteTools`。
+
     scripts\restore.ps1 -DryRun          # 只看差异，不写盘
     scripts\restore.ps1                  # 逐字节还原配置
     scripts\restore.ps1 -RestorePath     # 连用户 PATH 一起还原

@@ -1,6 +1,8 @@
 # dsh-windows-shell-toolchain
 
-> 给 **DeepSeek Harness (DSH)** 在 Windows 上配一个真正的 bash 执行器，并补上 PowerShell 7 便携版。**不需要管理员**，全程可回滚。
+> 给 **DeepSeek Harness (DSH)** 在 Windows 上配一个真正的 bash 执行器，并补上 PowerShell 7 便携版。**不需要管理员**。
+>
+> **可回滚至技能改动配置之前。**
 >
 > 设计前提：**机器上已经有的就先用手上的**；装完再把"要不要换最新版"交给你决定，绝不静默升级。
 
@@ -107,6 +109,14 @@ setup-tools.ps1 -Upgrade -KeepOldVersions   # 保留旧版本目录
 
 ## 回滚与卸载
 
+| 能回滚 | 不能回滚 |
+|---|---|
+| `<DSH home>\profiles\*\cordis.patch.yml` 等配置（逐字节 + SHA-256 校验） | 已解压的工具目录（`git-<版本>` / `PowerShell-<版本>`） |
+| 用户 PATH（回到快照那一刻的值） | 清理阶段删掉的安装包（`.7z.exe` / `.zip`） |
+| | 清理阶段删掉的旧版本目录 |
+
+要彻底回到"没装过"的状态：`restore.ps1 -Uninstall -DeleteTools`（先还原配置与 PATH，再删 `-Root` 目录）。
+
 ```powershell
 restore.ps1 -DryRun          # 只看差异
 restore.ps1                  # 逐字节还原配置
@@ -125,7 +135,7 @@ DSH 可执行文件路径是**运行时探测**的（运行中的进程 → 卸�
 
 ## English summary
 
-An agent skill that gives DeepSeek Harness a real bash executor on Windows and fills in a portable PowerShell 7. No admin rights, no plugin, fully revertible.
+An agent skill that gives DeepSeek Harness a real bash executor on Windows and fills in a portable PowerShell 7. No admin rights, no plugin. Rollback restores the DSH profile files and the user PATH byte-exactly to the state before the skill touched them; extracted tool directories, deleted installers and retired versions are not restored by it.
 
 It is **two-phase**: use the shell the machine already has (only re-ordering the user PATH so the chosen one actually wins, and installing just the component that is missing), report an upgrade offer at the end, and download/install a newer release only when the user opts in (`-Upgrade` or `-AskUpgrade`). Downloads race a built-in mirror list by latency with GitHub as the final fallback and are verified by sha256 when the release publishes a digest. A machine copy that is newer than upstream is kept. Rollback is a single script; the DSH executable is discovered at run time instead of being hard-coded.
 
