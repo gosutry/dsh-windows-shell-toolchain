@@ -1,0 +1,50 @@
+name: windows-smoke
+
+# Manual only: click "Run workflow" in the Actions tab.
+# Stage 1 checks that a native (non-MSYS) bash starts and prints a version on Windows.
+# Stage 2 (workspace-write reproduction) is added separately once stage 1 is green.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bash-start:
+    runs-on: windows-2025
+    steps:
+      - name: Download niubash (win-x64) and verify sha256
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = 'v1.5.0'
+          $zip = "niubash-$v-win-x64.tar.gz"
+          $base = "https://github.com/unixwin/niubash/releases/download/$v"
+          curl.exe -L --retry 3 --retry-delay 2 -o $zip "$base/$zip"
+          curl.exe -L --retry 3 --retry-delay 2 -o SHA256SUMS "$base/SHA256SUMS"
+          $want = (Select-String -Path SHA256SUMS -Pattern ([regex]::Escape($zip) + '$')).Line.Split(' ')[0]
+          $got = (Get-FileHash -Algorithm SHA256 -LiteralPath $zip).Hash.ToLower()
+          Write-Host "want=$want"
+          Write-Host "got =$got"
+          if ($want -ne $got) { throw "sha256 mismatch" }
+          tar.exe -xf $zip
+          Get-ChildItem
+
+      - name: Native bash starts and reports a version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bash = ".\niubash-v1.5.0-win-x64\winuxcmd\usr\bin\bash.exe"
+          if (-not (Test-Path -LiteralPath $bash)) { throw "bash.exe not found at $bash" }
+          & $bash -c 'echo "BASH_VERSION=$BASH_VERSION"; uname -s'
+          $code = $LASTEXITCODE
+          Write-Host "exit=$code"
+          if ($code -ne 0) { throw "bash exited $code" }
+
+      - name: Exit code is passed through
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $bash = ".\niubash-v1.5.0-win-x64\winuxcmd\usr\bin\bash.exe"
+          & $bash -c 'exit 7'
+          $code = $LASTEXITCODE
+          Write-Host "exit=$code"
+          if ($code -ne 7) { throw "expected exit 7, got $code" }
