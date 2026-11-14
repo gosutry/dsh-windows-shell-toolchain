@@ -1,19 +1,32 @@
 name: windows-smoke
 
-# Manual only. Runs THIS repository's scripts on a real Windows machine:
-#   detect -> snapshot -> install bash executor -> patch profile -> assert -> rollback.
-# It answers "do the scripts work end to end", not "does a downloaded tarball start".
+# Manual only. Runs THIS repository's scripts on real Windows machines, two architectures.
+#   detect -> snapshot -> install bash executor -> patch profile -> assert -> rollback
+# Pinned image labels on purpose: the identity stays put when GitHub migrates -latest.
 
 on:
   workflow_dispatch:
 
 jobs:
   skill-scripts:
-    runs-on: windows-2025
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025-vs2026, windows-11-vs2026-arm]
+    runs-on: ${{ matrix.os }}
+    name: skill-scripts (${{ matrix.os }})
     steps:
       - uses: actions/checkout@v4
 
-      - name: Prepare a fake DSH home with one profile
+      - name: 0) Report the machine
+        shell: powershell
+        run: |
+          Write-Host "OS:      $env:OS"
+          Write-Host "ARCH:    $env:PROCESSOR_ARCHITECTURE"
+          [System.Environment]::OSVersion.Version | ForEach-Object { Write-Host "VERSION: $_" }
+          (Get-Command bash -ErrorAction SilentlyContinue).Source
+
+      - name: 1) Prepare a fake DSH home with one profile
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -21,29 +34,28 @@ jobs:
           $prof = Join-Path $home_ 'profiles\desktop'
           New-Item -ItemType Directory -Force -Path $prof | Out-Null
           Set-Content -LiteralPath (Join-Path $prof 'cordis.patch.yml') -Value '# placeholder-before-skill' -Encoding ASCII
-          Write-Host "dsh home: $home_"
 
-      - name: 1) Resolve only - detect and plan, write nothing
+      - name: 2) Resolve only - detect and plan, write nothing
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $root = Join-Path $env:RUNNER_TEMP 'dsh-tools'
           .\scripts\setup-tools.ps1 -ResolveOnly -Root $root -SkipPs7 -DshHome (Join-Path $env:USERPROFILE '.dsh')
 
-      - name: 2) Snapshot before any change
+      - name: 3) Snapshot before any change
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           .\scripts\restore.ps1 -Snapshot -DshHome (Join-Path $env:USERPROFILE '.dsh')
 
-      - name: 3) Install bash executor and patch the profile
+      - name: 4) Install bash executor and patch the profile
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
           $root = Join-Path $env:RUNNER_TEMP 'dsh-tools'
           .\scripts\setup-tools.ps1 -Root $root -SkipPs7 -PatchProfile -Workspace (Get-Location).Path -DshHome (Join-Path $env:USERPROFILE '.dsh')
 
-      - name: 4) Assert the installed bash actually runs
+      - name: 5) Assert the installed bash actually runs
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -57,7 +69,7 @@ jobs:
           & $bash -c 'echo "BASH_VERSION=$BASH_VERSION"; uname -s'
           if ($LASTEXITCODE -ne 0) { throw "bash exited $LASTEXITCODE" }
 
-      - name: 5) Assert the profile patch is what the skill promises
+      - name: 6) Assert the profile patch is what the skill promises
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -69,7 +81,7 @@ jobs:
           Write-Host '--- patched file ---'
           Write-Host $t
 
-      - name: 6) Rollback and assert the original content is back
+      - name: 7) Rollback and assert the original content is back
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
