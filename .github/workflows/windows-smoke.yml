@@ -55,19 +55,28 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP 'dsh-tools'
           .\scripts\setup-tools.ps1 -Root $root -SkipPs7 -PatchProfile -Workspace (Get-Location).Path -DshHome (Join-Path $env:USERPROFILE '.dsh')
 
-      - name: 5) Assert the installed bash actually runs
+      - name: 5) Assert the chosen bash (from the user PATH) actually runs
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          $root = Join-Path $env:RUNNER_TEMP 'dsh-tools'
-          $bash = Get-ChildItem -Path $root -Directory -Filter 'git-*' -ErrorAction SilentlyContinue |
-                  ForEach-Object { Join-Path $_.FullName 'bin\bash.exe' } |
-                  Where-Object { Test-Path -LiteralPath $_ } |
-                  Select-Object -First 1
-          if (-not $bash) { throw 'no git-*\bin\bash.exe found under Root' }
-          Write-Host "bash: $bash"
+          $userPath = [Environment]::GetEnvironmentVariable('Path','User')
+          $parts = @($userPath -split ';' | Where-Object { $_ -ne '' })
+          Write-Host "user PATH entry 0: $($parts[0])"
+          $bash = $null
+          foreach ($p in $parts) {
+            $c = Join-Path $p 'bash.exe'
+            if (Test-Path -LiteralPath $c) { $bash = $c; break }
+          }
+          if (-not $bash) { throw 'no bash.exe anywhere on the user PATH' }
+          Write-Host "chosen bash: $bash"
           & $bash -c 'echo "BASH_VERSION=$BASH_VERSION"; uname -s'
           if ($LASTEXITCODE -ne 0) { throw "bash exited $LASTEXITCODE" }
+          $chosenDir = Split-Path -Parent $bash
+          if ($parts[0].TrimEnd('\') -ne $chosenDir.TrimEnd('\')) {
+            Write-Host "WARN: chosen bash dir is not the first user PATH entry"
+          } else {
+            Write-Host "OK: chosen bash dir is first on the user PATH"
+          }
 
       - name: 6) Assert the profile patch is what the skill promises
         shell: powershell
