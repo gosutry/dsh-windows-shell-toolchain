@@ -126,12 +126,20 @@ setup-tools.ps1 -Upgrade -KeepOldVersions   # 保留旧版本目录
 |---|---|---|
 | `%LOCALAPPDATA%\dsh-tools` | 只在"缺"或"升级"时解压 PortableGit / PowerShell 7，目录带版本号；解压后删压缩包、升级后删旧版本目录（`-KeepArchives` / `-KeepOldVersions` 可关掉） | `restore.ps1 -Uninstall -DeleteTools` |
 | 用户 PATH | 把选中的目录**提到最前**（并删掉自己装过的过期条目） | `restore.ps1 -Uninstall`（会剔除 `-ToolsRoot` 下的条目） |
-| `<DSH home>\profiles\*\cordis.patch.yml` | 追加一段带标记的执行器条目（`bash-sandbox`） | `restore.ps1` **只删这一段**，文件其余部分不动 |
+| `<DSH home>\profiles\*\cordis.patch.yml` | 写入一段带标记的双执行器条目（bash 与 pwsh 各占一个 realm） | `restore.ps1` **只删这一段**，文件其余部分不动 |
 | `%LOCALAPPDATA%\dsh-windows-shell\state.json` | 记录"检查过/已提议/已拒绝"的版本 | 删文件 |
 
 **PATH 的硬边界**：Windows 的生效顺序是"机器级在前、用户级在后"，所以 `C:\Windows\System32\bash.exe`（装了 WSL 才有）永远压过用户 PATH。这种情况下脚本会告警，并可以用 `-Launcher` 生成一个先把目录塞进 PATH 再启动 DSH 的 ```launch-dsh.cmd```。
 
-**代价（写在明面上）**：切换后 `pwsh` 工具名存实亡（执行器是 bash，PowerShell 语法会报错），需要 PowerShell 时显式调 `pwsh -NoProfile -Command`。执行器必须用 `bash-sandbox` 而不是 `bash-local`：后者没有 `sandboxMode`，会让权限预设插件拒绝挂载、聊天框的模式选择器消失。
+**两个执行器各占一个 realm**：`tool-bash` / `bash-sandbox` 一对挂 `isolate: { shell: bash }`，`pwsh-sandbox` 留在默认 realm 并带 `pwshPath`。一个上下文作用域内只能有一个 `ctx.shell`，拆成两个 realm 之后两个工具各连各的执行器，`pwsh` 工具能直接吃 PowerShell 语法。
+
+执行器仍必须用 `*-sandbox` 而不是 `*-local`：后者没有 `sandboxMode`，会让权限预设插件拒绝挂载、聊天框的模式选择器消失。
+
+### 双执行器是怎么写进去的
+
+`-PatchProfile` 写的是固定形态的一块：bash 一对挂 `isolate: { shell: bash }`，`pwsh-sandbox` 留在默认 realm 并记录 `pwshPath`。补丁在**安装之后**写，所以 `pwshPath` 一定是真实存在的可执行文件；`-SkipPs7` 且本机没有 pwsh 时脚本直接失败退出，不会写一个指向空处的执行器。
+
+写入是**原地替换**：同时认新标记（`isolated dual executor`）与旧标记（`bash executor (sandboxing variant)`），从较早出现的那个标记处截断再写，因此旧机器升级不会出现两段块、四个 id 各出现两次。写完先做结构校验（无 tab、四个 id 各恰好一次、每行是注释/列表项/缩进续行），不通过就整份不写并打印 `rejected, current file left alone`。
 
 ## 回滚与卸载
 
@@ -161,6 +169,7 @@ DSH 可执行文件路径是**运行时探测**的（运行中的进程 → 卸�
 ## 已验证 / 未验证
 
 - 已验证（本机实测）：探测能识别系统 Git 的 bash 2.56.0 与 pwsh 7.6.9，正确给出 `UPGRADE-OFFER` 且不下载；真实升级后再跑一次会走"已最新"分支并把遗留压缩包删掉（实测 167.3 MB，780→613 MB，正在使用的目录与诱饵目录均未受影响）；`-DryRun` 不改 PATH、不建目录；镜像测速真实选中 `gh-proxy.com` 并完成下载；sha256 校验、验签、解压后 smoke test 通过；`restore.ps1` 快照 6 个文件、`-DryRun` 全部 SAME、`-Uninstall -DryRun` 只比对不写盘；`restart-dsh.ps1 -ResolveOnly` 与 `restart-dsh.cmd -ResolveOnly`（参数转发）都能解析到真实 exe；全部脚本纯 ASCII、在 Windows PowerShell 5.1 下跑通。
+- 已验证（维护者实测）：双执行器共存——`bash` 与 `pwsh` 两个工具同时可用，交替调用各命中自己的执行器。
 - 未验证：全新无 Git / 无 PS7 机器上的首次安装（路径分支存在但未实跑）；`-AskUpgrade` 在无控制台时的实际交互（逻辑已按"跳过"处理）。
 - 已证不可用（issue #1）：MSYS 系 bash（PortableGit 自带）在受限沙箱（workspace-write / read-only）下启动即失败，报 `couldn't create signal pipe, Win32 error 5`。改用 `-BashSource sandbox`（niubash）后同档实测可跑，且写工作区外仍被拒绝。
 
