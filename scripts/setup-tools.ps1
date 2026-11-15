@@ -17,6 +17,8 @@
     -GitVersion V    pinned PortableGit release, or 'latest' (default)
     -Ps7Version V    pinned PowerShell release, or 'latest' (default)
     -Mirror LIST     extra download prefixes, ';' separated, tried before the built-in list
+    -DownloadBudgetSec N  wall-clock budget for one archive download; a stalled mirror
+                     costs seconds, not the whole session (default 600)
     -NoAutoMirror    disable the built-in mirror list and the latency probe
     -ResolveOnly     print detection, plan and upstream versions; download and write nothing
     -DryRun          print every write that would happen; write nothing
@@ -62,12 +64,122 @@ param(
   [string]$Profile = '',
   [string]$Workspace = '',
   [string]$DshHome = '',
-  [int]$ProbeTimeoutSec = 25
+  [ValidateSet('auto', 'sandbox', 'local', 'portablegit')]
+  [string]$BashSource = 'auto',
+  [switch]$AllowDangerFullAccess,
+  [switch]$UpdateExecutor,
+  [switch]$Restart,
+  [int]$ProbeTimeoutSec = 25,
+  [int]$DownloadBudgetSec = 600
 )
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+
+# Native tools (curl.exe, tar.exe, bash.exe) report failure on stderr, and Windows PowerShell 5.1
+# turns a native stderr line into an ErrorRecord - which is fatal under 'Stop'. Running under the
+# DSH restricted sandbox makes curl.exe fail its TLS handshake, so the first probe aborted the
+# whole run before the plan was printed. Every native call goes through here instead.
+function Invoke-NativeCapture([string]$Exe, [string[]]$ArgList) {
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  $lines = @()
+  $code = -1
+  try {
+    $raw = & $Exe @ArgList 2>&1
+    $code = $LASTEXITCODE
+    foreach ($x in @($raw)) {
+      if ($x -is [System.Management.Automation.ErrorRecord]) { $lines += [string]$x.Exception.Message }
+      elseif ($null -ne $x) { $lines += [string]$x }
+    }
+  } catch {
+    $code = -1
+  } finally {
+    $ErrorActionPreference = $prev
+  }
+  return [pscustomobject]@{ ExitCode = $code; Lines = $lines }
+}
+
+# A dead end must be loud. Quietly degrading (installing into %TEMP%, reporting "cannot
+# install") wastes an entire run: the caller never learns that one escalated retry would have
+# worked. Every sandbox wall raises this marker and ends with exit code 3.
+$script:Escalated = $false
+function Write-Escalation([string]$Reason, [string]$Rerun) {
+  $script:Escalated = $true
+  Write-Log ''
+  Write-Log 'REQUIRES-ESCALATION mode=danger-full-access'
+  Write-Log ('  reason: ' + $Reason)
+  Write-Log ('  rerun : powershell -NoProfile -ExecutionPolicy Bypass -File "' + $PSCommandPath + '"' + $(if ($Rerun) { ' ' + $Rerun } else { '' }))
+  Write-Log '  retry that exact command with sandbox_permissions=danger-full-access and a justification.'
+  Write-Log '  Do not report "not installed" without that retry: inside the restricted sandbox no'
+  Write-Log '  downloader and no shell spawn can succeed.'
+}
+
+# The DSH sandbox denies writes outside the workspace, so the default install root can be
+# unusable. Probe before writing instead of dying on the first New-Item.
+function Test-PathWritable([string]$Path) {
+  if (-not $Path) { return $false }
+  try {
+    if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType Directory -Force -Path $Path -ErrorAction Stop | Out-Null }
+    $probe = Join-Path $Path ('wtest-' + [guid]::NewGuid().ToString('N') + '.tmp')
+    Set-Content -LiteralPath $probe -Value 'x' -Encoding ASCII -ErrorAction Stop
+    Remove-Item -LiteralPath $probe -Force -ErrorAction Stop
+    return $true
+  } catch {
+    return $false
+  }
+}
+
+# Node keeps its own TLS stack, so it downloads where Schannel-based tools cannot: that is the
+# case inside the DSH restricted sandbox and on hosts with a broken Schannel credential store.
+function Invoke-NodeDownload([string]$Url, [string]$Dest) {
+  $exe = $env:DSH_NODE_EXECUTABLE
+  if (-not $exe -or -not (Test-Path -LiteralPath $exe)) { return $false }
+  if (-not $Root -or -not (Test-Path -LiteralPath $Root)) { return $false }
+  $js = Join-Path $Root 'node-download.cjs'
+  $body = @'
+const https = require("https");
+const fs = require("fs");
+const url = process.argv[2];
+const out = process.argv[3];
+let hops = 0;
+// Nothing used to bound this: a stalled TLS read hung the whole script until the caller's
+// timeout killed it. Idle sockets and the overall transfer are both capped now.
+setTimeout(function () { console.error("overall timeout"); process.exit(8); }, 480000).unref();
+function get(u) {
+  const req = https.get(u, { headers: { "user-agent": "dsh-setup-tools" }, timeout: 60000 }, function (r) {
+    const s = r.statusCode;
+    if (s >= 300 && s < 400 && r.headers.location) {
+      r.resume();
+      if (++hops > 8) { process.exit(3); }
+      return get(r.headers.location);
+    }
+    if (s !== 200) { r.resume(); console.error("http " + s); process.exit(4); }
+    const f = fs.createWriteStream(out);
+    r.pipe(f);
+    f.on("finish", function () { f.close(function () { process.exit(0); }); });
+    f.on("error", function () { process.exit(5); });
+  });
+  req.on("timeout", function () { console.error("idle timeout"); req.destroy(); process.exit(7); });
+  req.on("error", function (e) { console.error(e.message); process.exit(6); });
+}
+get(url);
+'@
+  $prev = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    Set-Content -LiteralPath $js -Value $body -Encoding ASCII -ErrorAction Stop
+    $env:ELECTRON_RUN_AS_NODE = '1'
+    $res = Invoke-NativeCapture $exe @($js, $Url, $Dest)
+    return ($res.ExitCode -eq 0 -and (Test-Path -LiteralPath $Dest))
+  } catch {
+    return $false
+  } finally {
+    Remove-Item Env:\ELECTRON_RUN_AS_NODE -ErrorAction SilentlyContinue
+    $ErrorActionPreference = $prev
+  }
+}
 
 # Rule 2 of this skill is "scripts are pure ASCII", and a stray 0x08 byte had already slipped
 # into a comment. Check the file itself instead of trusting the rule.
@@ -87,8 +199,26 @@ if ($selfBad.Count -gt 0) {
   Write-Host ('WARNING: ' + $selfBad.Count + ' non-ASCII/control byte(s) in this script, first at offset ' + $selfBad[0] + ' (see SKILL.md rule 2)')
 }
 
-if (-not $Root) { $Root = Join-Path $env:LOCALAPPDATA 'dsh-tools' }
-if (-not $StateDir) { $StateDir = Join-Path $env:LOCALAPPDATA 'dsh-windows-shell' }
+# The install root can move (a different drive, a portable DSH). Recover it from whatever this
+# script previously put on the user PATH instead of silently starting a second copy.
+function Get-RootFromUserPath {
+  foreach ($p in @(([Environment]::GetEnvironmentVariable('Path', 'User')) -split ';' | Where-Object { $_ -ne '' })) {
+    $n = $p.TrimEnd('\')
+    if ($n -match '^(?<root>.+)\\(git-[\d.]+\\(bin|usr\\bin)|niubash-[\d.]+\\winuxcmd\\usr\\bin)$') {
+      return $Matches['root']
+    }
+  }
+  return $null
+}
+
+$localAppData = $env:LOCALAPPDATA
+if (-not $localAppData -and $env:USERPROFILE) { $localAppData = Join-Path $env:USERPROFILE 'AppData\Local' }
+if (-not $localAppData) { throw 'LOCALAPPDATA and USERPROFILE are both unset; pass -Root and -StateDir' }
+if (-not $Root) {
+  $inferred = Get-RootFromUserPath
+  if ($inferred) { $Root = $inferred } else { $Root = Join-Path $localAppData 'dsh-tools' }
+}
+if (-not $StateDir) { $StateDir = Join-Path $localAppData 'dsh-windows-shell' }
 $Root = $Root.TrimEnd('\')
 
 # PROCESSOR_ARCHITECTURE is this process's bitness, not the machine's: a 32-bit process on a
@@ -178,16 +308,107 @@ function Test-WslPath([string]$Path) {
   return $false
 }
 
-function Get-FirstRealBash {
-  foreach ($c in @(Get-Command -Name 'bash' -CommandType Application -All -ErrorAction SilentlyContinue)) {
-    if (-not (Test-WslPath $c.Source)) { return $c.Source }
+# A bash on PATH is only usable when it actually runs a command. The WSL placeholder and a
+# broken install both answer "found" yet fail at spawn time, so probe instead of trusting PATH.
+function Test-BashRunnable([string]$Exe) {
+  if (-not $Exe) { return $false }
+  if (-not (Test-Path -LiteralPath $Exe)) { return $false }
+  try {
+    $out = & $Exe -c 'echo $BASH_VERSION' 2>$null
+    return ($LASTEXITCODE -eq 0 -and ("$out").Trim().Length -gt 0)
+  } catch {
+    return $false
+  }
+}
+
+# A copy this script installed under -Root is the one its own PATH entry points at, so it
+# outranks whatever a stale (pre-restart) process PATH still resolves. Without this, a re-run
+# inside the DSH process that installed it reports the old bash and installs a second copy.
+function Get-ManagedBash {
+  if (-not $Root -or -not (Test-Path -LiteralPath $Root)) { return $null }
+  foreach ($pat in @('niubash-*\winuxcmd\usr\bin\bash.exe', 'git-*\bin\bash.exe', 'git-*\usr\bin\bash.exe')) {
+    foreach ($f in @(Get-ChildItem -Path (Join-Path $Root $pat) -ErrorAction SilentlyContinue | Sort-Object FullName -Descending)) {
+      if (Test-BashRunnable $f.FullName) { return $f.FullName }
+    }
   }
   return $null
 }
 
+function Get-FirstRealBash {
+  $managed = Get-ManagedBash
+  if ($managed) { return $managed }
+  foreach ($c in @(Get-Command -Name 'bash' -CommandType Application -All -ErrorAction SilentlyContinue)) {
+    if (Test-WslPath $c.Source) { continue }
+    if (Test-BashRunnable $c.Source) { return $c.Source }
+  }
+  # Git for Windows puts only <Git>\cmd on PATH (git.exe and friends); bash.exe lives in
+  # <Git>\bin, so a PATH-only lookup misses a perfectly runnable bash. Fall back to the
+  # well-known install roots, the registry first because it names the real install path.
+  $roots = New-Object System.Collections.Generic.List[string]
+  foreach ($k in @('HKLM:\SOFTWARE\GitForWindows', 'HKLM:\SOFTWARE\WOW6432Node\GitForWindows')) {
+    if (Test-Path -LiteralPath $k) {
+      $ip = (Get-ItemProperty -LiteralPath $k -ErrorAction SilentlyContinue).InstallPath
+      if ($ip -and -not $roots.Contains($ip)) { $roots.Add($ip) }
+    }
+  }
+  $pf86 = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+  $cands = @("$env:ProgramFiles\Git", "$env:LOCALAPPDATA\Programs\Git")
+  if ($pf86) { $cands += "$pf86\Git" }
+  foreach ($p in $cands) {
+    if ($p -and -not $roots.Contains($p)) { $roots.Add($p) }
+  }
+  foreach ($root in $roots) {
+    foreach ($rel in @('bin\bash.exe', 'usr\bin\bash.exe')) {
+      $cand = Join-Path $root $rel
+      if (Test-BashRunnable $cand) { return $cand }
+    }
+  }
+  return $null
+}
+
+# Same blind spot the bash lookup had (see Get-FirstRealBash): an install that never reached PATH
+# is still usable. A win-x64 MSI puts pwsh under ProgramFiles while an inherited user PATH may
+# predate it, and a copy this script unpacked under -Root is not on PATH by design.
+function Test-PwshRunnable([string]$Exe) {
+  if (-not $Exe) { return $false }
+  if (-not (Test-Path -LiteralPath $Exe)) { return $false }
+  try {
+    # Collect first: piping into Select-Object stops the pipeline early and leaves $LASTEXITCODE
+    # at -1, which would make this probe reject every working pwsh.
+    $out = @(& $Exe -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.Major' 2>$null)
+    $code = $LASTEXITCODE
+    if ($code -ne 0) { return $false }
+    $out = @($out | Select-Object -First 1)
+    $maj = 0
+    if (-not [int]::TryParse(("$out").Trim(), [ref]$maj)) { return $false }
+    return ($maj -ge 6)
+  } catch {
+    return $false
+  }
+}
+
 function Get-FirstPwsh {
-  $c = Get-Command -Name 'pwsh' -CommandType Application -All -ErrorAction SilentlyContinue | Select-Object -First 1
-  if ($c) { return $c.Source }
+  if ($Root -and (Test-Path -LiteralPath $Root)) {
+    foreach ($f in @(Get-ChildItem -Path (Join-Path $Root 'PowerShell-*\pwsh.exe') -ErrorAction SilentlyContinue | Sort-Object FullName -Descending)) {
+      if (Test-PwshRunnable $f.FullName) { return $f.FullName }
+    }
+  }
+  foreach ($c in @(Get-Command -Name 'pwsh' -CommandType Application -All -ErrorAction SilentlyContinue)) {
+    if (Test-PwshRunnable $c.Source) { return $c.Source }
+  }
+  $cands = New-Object System.Collections.Generic.List[string]
+  $pf = [Environment]::GetEnvironmentVariable('ProgramFiles')
+  if (-not $pf) { $pf = $env:ProgramFiles }
+  if ($pf) { $cands.Add((Join-Path $pf 'PowerShell\7\pwsh.exe')) }
+  if ($env:LOCALAPPDATA) { $cands.Add((Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe')) }
+  try {
+    foreach ($f in @(Get-ChildItem -Path (Join-Path $Root 'PowerShell-*\pwsh.exe') -ErrorAction SilentlyContinue)) {
+      $cands.Add($f.FullName)
+    }
+  } catch { }
+  foreach ($cand in $cands) {
+    if (Test-PwshRunnable $cand) { return $cand }
+  }
   return $null
 }
 
@@ -196,12 +417,96 @@ function Get-FirstPwsh {
 function Normalize-ShellDir([string]$Exe) {
   if (-not $Exe) { return $null }
   $dir = Split-Path -Parent $Exe
+  # niubash keeps every tool in winuxcmd\usr\bin; that IS its PATH directory (see PathDir below).
+  # Applying the Git rule to it yields winuxcmd\bin - no coreutils - and the next run flips PATH back.
+  if ($dir -match '\\winuxcmd\\usr\\bin$') { return $dir }
   if ($dir -match '\\usr\\bin$') {
     $gitRoot = Split-Path -Parent (Split-Path -Parent $dir)
     $cand = Join-Path $gitRoot 'bin'
     if (Test-Path -LiteralPath (Join-Path $cand 'bash.exe')) { return $cand }
   }
   return $dir
+}
+
+# Bash providers ------------------------------------------------------------
+# Chosen by runtime capability, not by brand: an MSYS-family bash cannot start under the DSH
+# restricted sandbox (its per-process signal pipe needs a named pipe the restricted token may
+# not open), so a provider with no POSIX emulation layer is preferred unless one is pinned.
+function Get-BashProviders {
+  $nArch = if ($arch -eq 'arm64') { 'arm64' } else { 'x64' }
+  $gArch = if ($arch -eq 'arm64') { 'arm64' } elseif ($arch -eq 'x86') { '32-bit' } else { '64-bit' }
+  @(
+    [pscustomobject]@{
+      Id = 'niubash'; Repo = 'unixwin/niubash'
+      SupportedArch = @('x64', 'arm64')
+      AssetPattern = ('niubash-v[\d.]+-win-' + $nArch + '\.tar\.gz$')
+      Pack = 'tar.gz'; DirPrefix = 'niubash-'
+      Entry = 'winuxcmd\usr\bin\bash.exe'; PathDir = 'winuxcmd\usr\bin'
+    }
+    [pscustomobject]@{
+      Id = 'portablegit'; Repo = 'git-for-windows/git'
+      SupportedArch = @('x64', 'arm64', 'x86')
+      AssetPattern = ('PortableGit-[\d.]+-' + $gArch + '\.7z\.exe$')
+      Pack = '7z'; DirPrefix = 'git-'
+      Entry = 'bin\bash.exe'; PathDir = 'bin'
+    }
+  )
+}
+
+# Requests: sandbox (must run confined), portablegit (pin the old behaviour),
+# local (use what the machine already has, may need danger-full-access), auto (default).
+function Select-BashProvider([string]$Requested) {
+  $all = @(Get-BashProviders)
+  $niubash = $all | Where-Object { $_.Id -eq 'niubash' } | Select-Object -First 1
+  $git = $all | Where-Object { $_.Id -eq 'portablegit' } | Select-Object -First 1
+  if ($Requested -eq 'portablegit' -or $Requested -eq 'local') { return $git }
+  if ($Requested -eq 'sandbox') {
+    if ($niubash.SupportedArch -notcontains $arch) {
+      throw ('niubash ships no ' + $arch + ' build; pass -BashSource portablegit -AllowDangerFullAccess')
+    }
+    return $niubash
+  }
+  if ($niubash.SupportedArch -contains $arch) { return $niubash }
+  return $git
+}
+
+# niubash answers MSYS_NT from uname -s, so the banner alone cannot tell it apart from an
+# MSYS build. Its install path can: anything under <Root>\niubash-* is the sandbox-capable
+# provider. Without this, -BashSource sandbox re-installed an already working niubash on every
+# run (needGit went true forever) and re-downloaded the archive.
+function Test-NiubashExe([string]$Exe) {
+  return ($null -ne (Get-NiubashVersionFromPath $Exe))
+}
+
+# Path cannot tell the families apart (both end in usr\bin\bash.exe); the runtime banner can.
+# MSYS/Cygwin builds answer MINGW*/MSYS*/CYGWIN* and cannot start under the restricted sandbox.
+function Test-MsysBash([string]$Exe) {
+  if (-not $Exe) { return $false }
+  if (Test-NiubashExe $Exe) { return $false }
+  try {
+    $u = (& $Exe -c 'uname -s' 2>$null | Select-Object -First 1)
+    if ($u) { return ([string]$u).Trim() -match '^(MINGW|MSYS|CYGWIN)' }
+  } catch { }
+  return $false
+}
+
+# niubash carries its release in the directory it installs into, so a bare VERSION probe cannot
+# tell one release from another; read it from the path instead.
+function Get-NiubashVersionFromPath([string]$Exe) {
+  if (-not $Exe) { return $null }
+  $m = [regex]::Match($Exe, '[\\/]niubash-(v?[\d.]+)[\\/]winuxcmd[\\/]usr[\\/]bin[\\/]bash\.exe$')
+  if ($m.Success) { return ($m.Groups[1].Value -replace '^v', '') }
+  return $null
+}
+
+# A confined child cannot start an MSYS bash; say so once instead of letting every call fail.
+function Write-RestrictedBashWarning([string]$Exe) {
+  if (-not $Exe) { return }
+  if (Test-NiubashExe $Exe) { return }
+  if ((Test-Path -LiteralPath (Join-Path (Split-Path -Parent $Exe) '..\..\usr\bin\sh.exe') -ErrorAction SilentlyContinue) -or $Exe -match '\\usr\\bin\\bash\.exe$' -or $Exe -match '\\Git\\bin\\bash\.exe$') {
+    Write-Log '  warning: this is an MSYS-family bash. It runs in danger-full-access but cannot start'
+    Write-Log '           under workspace-write/read-only (signal pipe, Win32 error 5). Use -BashSource sandbox.'
+  }
 }
 
 function Test-WslBashPresent {
@@ -234,8 +539,9 @@ function Test-Head([string]$Url) {
     } catch { }
     return $bad
   }
-  $out = & curl.exe -sS -I -L -o NUL --connect-timeout 6 --max-time 12 -w '%{http_code} %{time_total}' $Url 2>$null
-  if ($LASTEXITCODE -ne 0 -or -not $out) { return $bad }
+  $res = Invoke-NativeCapture 'curl.exe' @('-sS', '-I', '-L', '-o', 'NUL', '--connect-timeout', '6', '--max-time', '12', '-w', '%{http_code} %{time_total}', $Url)
+  if ($res.ExitCode -ne 0 -or $res.Lines.Count -eq 0) { return $bad }
+  $out = $res.Lines
   $parts = @(($out -join ' ').Trim() -split '\s+')
   if ($parts.Count -lt 2) { return $bad }
   $code = $parts[0]
@@ -255,11 +561,9 @@ function Test-Throughput([string]$Url) {
   if (-not $HaveCurl) { return 0 }
   # -s (not -sS): with -S curl writes its timeout notice to stderr, and Windows PowerShell 5.1
   # turns native stderr into an error record. No regex escapes here on purpose.
-  $out = $null
-  try {
-    $out = & curl.exe -s -L -o NUL -r 0-262143 --connect-timeout 6 --max-time 10 -w '%{size_download} %{time_total}' $Url 2>$null
-  } catch { return 0 }
-  if (-not $out) { return 0 }
+  $res = Invoke-NativeCapture 'curl.exe' @('-s', '-L', '-o', 'NUL', '-r', '0-262143', '--connect-timeout', '6', '--max-time', '10', '-w', '%{size_download} %{time_total}', $Url)
+  if ($res.ExitCode -ne 0 -or $res.Lines.Count -eq 0) { return 0 }
+  $out = $res.Lines
   $p = @(($out -join ' ').Trim() -split ' +')
   if ($p.Count -lt 2) { return 0 }
   $bytes = 0.0
@@ -381,27 +685,43 @@ function Get-Download([string]$Url, [string]$Dest, [string]$Sha256, [string[]]$E
   if ($Offline) { throw ('offline mode: expected archive ' + $Dest) }
   $part = Join-Path (Split-Path -Parent $Dest) ((Split-Path -Leaf $Dest) + '.part')
   $sources = Get-SourceOrder $Url $ExtraMirror
+  $deadline = (Get-Date).AddSeconds($DownloadBudgetSec)
   foreach ($m in $sources) {
+    # A mirror that stalls must cost seconds, not the whole session. Every source is bounded and
+    # the loop gives up once the budget is spent, instead of walking the list for an hour while
+    # the caller's own timeout kills the run with nothing printed.
+    if ((Get-Date) -gt $deadline) {
+      throw ('download budget of ' + $DownloadBudgetSec + 's exhausted for ' + (Split-Path -Leaf $Dest) + ' after ' + (Get-Label $m) + ' - pass -DownloadBudgetSec N to wait longer, -Mirror <prefix> to pin a working source, or -Offline with a pre-placed archive')
+    }
     $u = if ($m -eq '') { $Url } else { $m + $Url }
     if (Test-Path -LiteralPath $part) { Remove-Item -LiteralPath $part -Force }
     Write-Plan ('downloading ' + (Split-Path -Leaf $Dest) + ' via ' + (Get-Label $m))
     $done = $false
     if ($HaveCurl) {
-      # -s keeps this quiet: curl's progress meter goes to stderr, and Windows PowerShell 5.1
-      # turns any native stderr into a terminating error that would abort the whole install.
-      # --speed-limit/--speed-time abort a mirror that dies mid-file so the loop rotates.
-      $doneHere = $false
-      try {
-        & curl.exe -s -L --fail --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 900 --speed-limit 4096 --speed-time 20 -o $part $u 2>$null
-        $doneHere = ($LASTEXITCODE -eq 0)
-      } catch {
-        Write-Plan ('download error from ' + (Get-Label $m) + ', next source')
-        $doneHere = $false
+      # -s keeps this quiet; --speed-limit/--speed-time abort a mirror that dies mid-file so the
+      # loop rotates to the next source instead of hanging on a dead connection.
+      $res = Invoke-NativeCapture 'curl.exe' @('-s', '-L', '--fail', '--retry', '3', '--retry-delay', '2', '--connect-timeout', '10', '--max-time', '240', '--speed-limit', '4096', '--speed-time', '20', '-o', $part, $u)
+      $done = ($res.ExitCode -eq 0 -and (Test-Path -LiteralPath $part))
+      if (-not $done) { Write-Plan ('curl could not fetch from ' + (Get-Label $m) + ', trying node') }
+    }
+    # Fallback 1: node's TLS stack - the way through a restricted sandbox, where curl.exe and
+    # .NET both fail the Schannel handshake (SEC_E_NO_CREDENTIALS / connection reset).
+    if (-not $done) {
+      if ((Get-Date) -gt $deadline) {
+        throw ('download budget of ' + $DownloadBudgetSec + 's exhausted for ' + (Split-Path -Leaf $Dest) + ' before the node fallback - pass -DownloadBudgetSec N to wait longer, or -Mirror <prefix>')
       }
-      $done = $doneHere
-    } else {
+      if (Test-Path -LiteralPath $part) { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
+      $done = Invoke-NodeDownload $u $part
+      if ($done) { Write-Plan ('node fetched ' + (Split-Path -Leaf $Dest) + ' via ' + (Get-Label $m)) }
+    }
+    # Fallback 2: plain .NET, for hosts with no curl and no DSH node executable.
+    if (-not $done) {
+      if ((Get-Date) -gt $deadline) {
+        throw ('download budget of ' + $DownloadBudgetSec + 's exhausted for ' + (Split-Path -Leaf $Dest) + ' before the .NET fallback - pass -DownloadBudgetSec N to wait longer, or -Mirror <prefix>')
+      }
+      if (Test-Path -LiteralPath $part) { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
       try {
-        Invoke-WebRequest -Uri $u -OutFile $part -UseBasicParsing -TimeoutSec 900
+        Invoke-WebRequest -Uri $u -OutFile $part -UseBasicParsing -TimeoutSec 240
         $done = $true
       } catch { $done = $false }
     }
@@ -425,7 +745,7 @@ function Get-Download([string]$Url, [string]$Dest, [string]$Sha256, [string[]]$E
     return
   }
   if ($part -and (Test-Path -LiteralPath $part)) { Remove-Item -LiteralPath $part -Force -ErrorAction SilentlyContinue }
-  throw ('download failed: ' + $Url + ' - try -Mirror <prefix> or -Offline with a pre-placed archive')
+  throw ('download failed: ' + $Url + ' - try -Mirror <prefix>, or -Offline with a pre-placed archive under ' + $Root + ' (a restricted sandbox blocks every downloader; install from a danger-full-access session and the archives stay reusable)')
 }
 
 # User PATH ----------------------------------------------------------------
@@ -476,9 +796,13 @@ function Read-State {
 
 function Save-State($State) {
   if ($DryRun -or $ResolveOnly) { return }
-  New-Item -ItemType Directory -Force -Path $StateDir | Out-Null
-  $p = Join-Path $StateDir 'state.json'
-  $State | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $p -Encoding UTF8
+  try {
+    if (-not (Test-Path -LiteralPath $StateDir)) { New-Item -ItemType Directory -Force -Path $StateDir -ErrorAction Stop | Out-Null }
+    $p = Join-Path $StateDir 'state.json'
+    $State | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $p -Encoding UTF8 -ErrorAction Stop
+  } catch {
+    Write-Plan ('state not saved (' + $StateDir + ' not writable in this mode) - upgrade bookkeeping only, install unaffected')
+  }
 }
 
 function Invoke-UpgradeOffer([string]$Name, [string]$Have, [string]$Want, $State) {
@@ -625,10 +949,15 @@ function Invoke-ProfilePatch {
     if ($old -eq $new) { Write-Plan ('already patched, unchanged: ' + $f); continue }
     if ($DryRun -or $ResolveOnly) { Write-Plan ('would patch: ' + $f + ' (cwd ' + $ws + ')'); continue }
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
-    if (Test-Path -LiteralPath $f) { Copy-Item -LiteralPath $f -Destination ($f + '.bak-' + $stamp) -Force }
-    [System.IO.File]::WriteAllText($f, $new, (New-Object System.Text.UTF8Encoding($false)))
-    if ([System.IO.File]::ReadAllText($f) -ne $new) { throw ('patch write did not take effect: ' + $f) }
-    Write-Log ('  patched: ' + $f)
+    try {
+      if (Test-Path -LiteralPath $f) { Copy-Item -LiteralPath $f -Destination ($f + '.bak-' + $stamp) -Force -ErrorAction Stop }
+      [System.IO.File]::WriteAllText($f, $new, (New-Object System.Text.UTF8Encoding($false)))
+      if ([System.IO.File]::ReadAllText($f) -ne $new) { throw ('patch write did not take effect: ' + $f) }
+      Write-Log ('  patched: ' + $f)
+    } catch {
+      Write-Log ('  cannot patch ' + $f + ': ' + $_.Exception.Message)
+      Write-Escalation ('profile patch denied for ' + $f + ' (' + $_.Exception.Message + ')') '-PatchProfile'
+    }
   }
 }
 
@@ -647,14 +976,33 @@ function Get-DirectChildOfRoot([string]$Path) {
   return $full
 }
 
+# The version directory under -Root that a path belongs to: <root>\niubash-X\winuxcmd\usr\bin\bash.exe
+# -> <root>\niubash-X. Cleanup compares direct children of -Root, so parent-of-bin is the wrong level
+# for a bash found by lookup and marked the live install as retired.
+function Get-ManagedVersionDir([string]$Path) {
+  if (-not $Path -or -not $Root) { return $null }
+  $res = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+  $rootRes = Resolve-Path -LiteralPath $Root -ErrorAction SilentlyContinue
+  if (-not $res -or -not $rootRes) { return $null }
+  $full = $res.Path.TrimEnd('\')
+  $rootFull = $rootRes.Path.TrimEnd('\')
+  if (-not $full.StartsWith($rootFull + '\')) { return $null }
+  $rel = $full.Substring($rootFull.Length + 1)
+  $seg = @($rel -split '\\')[0]
+  if (-not $seg) { return $null }
+  return ($rootFull + '\' + $seg)
+}
+
 function Get-ManagedKind([string]$Name) {
   if ($Name.StartsWith('git-')) { return 'git' }
+  if ($Name.StartsWith('niubash-')) { return 'bash' }
   if ($Name.StartsWith('PowerShell-')) { return 'pwsh' }
   return ''
 }
 
 function Test-ManagedDirExe([string]$Kind, [string]$DirPath) {
   if ($Kind -eq 'git') { return (Test-Path -LiteralPath (Join-Path $DirPath 'bin\bash.exe')) }
+  if ($Kind -eq 'bash') { return (Test-Path -LiteralPath (Join-Path $DirPath 'winuxcmd\usr\bin\bash.exe')) }
   if ($Kind -eq 'pwsh') { return (Test-Path -LiteralPath (Join-Path $DirPath 'pwsh.exe')) }
   return $false
 }
@@ -673,6 +1021,13 @@ function Get-ArchiveTargetDir([string]$Name) {
     $rest = $Name.Substring(11)
     $i = $rest.IndexOf('-win-')
     if ($i -gt 0) { return 'PowerShell-' + $rest.Substring(0, $i) }
+    return ''
+  }
+  # niubash-v1.5.0-win-x64.tar.gz -> niubash-v1.5.0 (the directory the archive unpacks into)
+  if ($Name.StartsWith('niubash-')) {
+    $rest = $Name.Substring(8)
+    $i = $rest.IndexOf('-win-')
+    if ($i -gt 0) { return 'niubash-' + $rest.Substring(0, $i) }
     return ''
   }
   return ''
@@ -735,9 +1090,12 @@ function Invoke-Cleanup([string[]]$ActiveDirs) {
   foreach ($item in $children) {
     if ($item.PSIsContainer) { continue }
     $n = $item.Name
-    $isArchive = ($n.StartsWith('PortableGit-') -and $n.EndsWith('.7z.exe')) -or ($n.StartsWith('PowerShell-') -and $n.EndsWith('.zip'))
+    $isArchive = ($n.StartsWith('PortableGit-') -and $n.EndsWith('.7z.exe')) -or ($n.StartsWith('PowerShell-') -and $n.EndsWith('.zip')) -or ($n.StartsWith('niubash-') -and $n.EndsWith('.tar.gz'))
     $isPart = $n.EndsWith('.part')
-    if (-not $isArchive -and -not $isPart) { continue }
+    # node-download.cjs is the fallback downloader this script writes into -Root; it is a
+    # leftover like the archives, not user content.
+    $isHelper = ($n -eq 'node-download.cjs')
+    if (-not $isArchive -and -not $isPart -and -not $isHelper) { continue }
     $full = Get-DirectChildOfRoot $item.FullName
     if (-not $full) { continue }
     if ($isArchive) {
@@ -769,8 +1127,21 @@ function Invoke-Cleanup([string[]]$ActiveDirs) {
 }
 
 # ---------------------------------------------------------------------------
-if (-not $ResolveOnly -and -not $DryRun -and -not (Test-Path -LiteralPath $Root)) {
-  New-Item -ItemType Directory -Force -Path $Root | Out-Null
+# Writing anywhere outside the workspace is denied inside the DSH restricted sandbox, and that
+# includes the default %LOCALAPPDATA% roots. Fall back to a writable directory instead of
+# failing on the first create.
+if (-not $ResolveOnly -and -not $DryRun -and -not (Test-PathWritable $Root)) {
+  # Deliberately no %TEMP% fallback: a toolchain parked in a temp directory is a silent
+  # downgrade that still needs a restart and a PATH write. Fail loudly and escalate.
+  Write-Escalation ('install root ' + $Root + ' is not writable in this mode') $(if ($PatchProfile) { '-PatchProfile' } else { '' })
+  Write-Log ''
+  Write-Log 'stopped: nothing was installed, nothing was written.'
+  exit 3
+} else {
+  # Resolve-only and dry-run write nothing - not even the install directory.
+  if (-not $ResolveOnly -and -not $DryRun -and -not (Test-Path -LiteralPath $Root)) {
+    New-Item -ItemType Directory -Force -Path $Root -ErrorAction SilentlyContinue | Out-Null
+  }
 }
 
 Write-Log '=== phase A: detect ==='
@@ -791,8 +1162,9 @@ if (-not $SkipGit) {
     } catch { }
     Write-Log ('  bash: ' + $bashExe)
     Write-Log ('        ' + $(if ($bashVer) { 'bash ' + $bashVer } else { 'version unknown' }) + $(if ($gitVer) { ', git ' + $gitVer } else { '' }))
+    if ($BashSource -eq 'sandbox') { Write-RestrictedBashWarning $bashExe }
   } else {
-    Write-Log '  bash: none usable on PATH'
+    Write-Log '  bash: none found (PATH and known Git install roots)'
   }
 }
 
@@ -805,7 +1177,7 @@ if (-not $SkipPs7) {
     } catch { }
     Write-Log ('  pwsh: ' + $pwshExe + ' (' + $(if ($pwshVer) { $pwshVer } else { 'version unknown' }) + ')')
   } else {
-    Write-Log '  pwsh: none on PATH'
+    Write-Log '  pwsh: none found (PATH, ProgramFiles\PowerShell\7, Root\PowerShell-*)'
   }
 }
 
@@ -818,14 +1190,14 @@ if ($wslHits.Count -gt 0) {
 
 Write-Log ''
 Write-Log '=== upstream ==='
-$gitAsset = $null
+$bashProvider = Select-BashProvider $BashSource
+$bashAsset = $null
 $psAsset = $null
 if (-not $Offline) {
   if (-not $SkipGit) {
-    $gitTag = if ($arch -eq 'arm64') { 'arm64' } elseif ($arch -eq 'x86') { '32-bit' } else { '64-bit' }
-    $gitPat = 'PortableGit-[\d.]+-' + $gitTag + '\.7z\.exe$'
-    $gitAsset = Resolve-Asset 'git-for-windows/git' $GitVersion $gitPat
-    if ($gitAsset) { Write-Log ('  git latest: ' + $gitAsset.Version) } else { Write-Log '  git latest: unknown (network unavailable)' }
+    $bashAsset = Resolve-Asset $bashProvider.Repo $GitVersion $bashProvider.AssetPattern
+    if ($bashAsset) { Write-Log ('  bash latest: ' + $bashAsset.Version + ' (' + $bashProvider.Id + ')') }
+    else { Write-Log ('  bash latest: unknown (network unavailable), provider ' + $bashProvider.Id) }
   }
   if (-not $SkipPs7) {
     $psTag = if ($arch -eq 'x86') { 'x86' } else { $arch }
@@ -841,10 +1213,21 @@ if (-not $Offline) {
 $needGit = $false
 $needPs7 = $false
 
+$bashHaveVer = if ($bashProvider.Id -eq 'portablegit') { $gitVer } else { Get-NiubashVersionFromPath $bashExe }
+
 if (-not $SkipGit) {
-  if (-not $bashExe) { $needGit = $true }
-  elseif ($Upgrade -and $gitAsset) {
-    $cmp = Compare-Ver $gitVer $gitAsset.Version
+  if ($BashSource -eq 'local') {
+    if (-not $bashExe) { throw '-BashSource local was requested but no runnable bash was found on PATH' }
+  } elseif (-not $bashExe) {
+    $needGit = $true
+  } elseif ($BashSource -eq 'sandbox' -and (Test-MsysBash $bashExe)) {
+    # A sandbox-capable bash was requested: an MSYS one cannot start confined, so install one that can.
+    # 'auto' keeps the documented rule (SKILL.md section 3): an existing bash that runs is used as
+    # is. Inside the restricted sandbox an MSYS bash fails the runnable probe above, so auto already
+    # lands on "none found" and installs niubash there - no special case needed here.
+    $needGit = $true
+  } elseif (($Upgrade -or $UpdateExecutor) -and $bashAsset -and $bashHaveVer) {
+    $cmp = Compare-Ver $bashHaveVer ($bashAsset.Version -replace '^v', '')
     if ($cmp -lt 0) { $needGit = $true }
   }
 }
@@ -857,23 +1240,46 @@ if (-not $SkipPs7) {
   }
 }
 
-if ($needGit -and -not $gitAsset) { throw ('bash is missing and no release could be resolved; use -Offline with an archive under ' + $Root + ' or fix the network / pass -Mirror') }
-if ($needPs7 -and -not $psAsset) { throw ('pwsh is missing and no release could be resolved; use -Offline with an archive under ' + $Root + ' or fix the network / pass -Mirror') }
+$resolveFail = @()
+if ($needGit -and -not $bashAsset) { $resolveFail += 'bash' }
+if ($needPs7 -and -not $psAsset) { $resolveFail += 'pwsh' }
+if ($resolveFail.Count -gt 0) {
+  Write-Log ('  cannot install ' + ($resolveFail -join '+') + ': upstream release could not be resolved')
+  if ($Offline) {
+    Write-Log ('  -Offline was requested: place the bash archive (niubash-v*-win-*.tar.gz) and PowerShell-*-win-*.zip under ' + $Root + ' and retry.')
+    Write-Log ''
+    Write-Log 'stopped (offline mode): nothing downloaded, nothing written.'
+    exit 2
+  }
+  Write-Escalation ('upstream release lookup failed for ' + ($resolveFail -join '+') + '; the restricted sandbox blocks every downloader (curl, .NET, node)') $(if ($PatchProfile) { '-PatchProfile' } else { '' })
+  Write-Log ''
+  Write-Log 'stopped: nothing downloaded, nothing written.'
+  exit 3
+}
 
-$gitDir = if ($needGit) { Join-Path $Root ('git-' + $gitAsset.Version) } else { $null }
+$gitDir = if ($needGit) { Join-Path $Root ($bashProvider.DirPrefix + $bashAsset.Version) } else { $null }
 $psDir = if ($needPs7) { Join-Path $Root ('PowerShell-' + $psAsset.Version) } else { $null }
-$bashFinal = if ($needGit) { Join-Path $gitDir 'bin\bash.exe' } else { $bashExe }
+$bashFinal = if ($needGit) { Join-Path $gitDir $bashProvider.Entry } else { $bashExe }
+$bashPathDir = if ($needGit) { Join-Path $gitDir $bashProvider.PathDir }
+elseif ($bashExe) { Normalize-ShellDir $bashExe } else { $null }
+$bashRootDir = if ($needGit) { $gitDir }
+elseif ($bashExe) { Get-ManagedVersionDir $bashExe } else { $null }
 $pwshFinal = if ($needPs7) { Join-Path $psDir 'pwsh.exe' } else { $pwshExe }
+$pwshRootDir = if ($needPs7) { $psDir } elseif ($pwshExe) { Get-ManagedVersionDir $pwshExe } else { $null }
 
 Write-Log ''
 Write-Log '=== plan ==='
-if ($needGit) { Write-Plan ('install PortableGit ' + $gitAsset.Version + ' -> ' + $gitDir) }
-else { Write-Plan ('use existing bash: ' + $bashExe) }
-if ($needPs7) { Write-Plan ('install PowerShell ' + $psAsset.Version + ' -> ' + $psDir) }
-else { Write-Plan ('use existing pwsh: ' + $pwshExe) }
+if (-not $SkipGit) {
+  if ($needGit) { Write-Plan ('install bash (' + $bashProvider.Id + ') ' + $bashAsset.Version + ' -> ' + $gitDir) }
+  else { Write-Plan ('use existing bash: ' + $bashExe) }
+}
+if (-not $SkipPs7) {
+  if ($needPs7) { Write-Plan ('install PowerShell ' + $psAsset.Version + ' -> ' + $psDir) }
+  else { Write-Plan ('use existing pwsh: ' + $pwshExe) }
+}
 if (-not $SkipPath) {
   $front = @()
-  if ($bashFinal) { $front += (Normalize-ShellDir $bashFinal) }
+  if ($bashPathDir) { $front += $bashPathDir }
   if ($pwshFinal) { $front += (Split-Path -Parent $pwshFinal) }
   $newPath = Compose-UserPath $front
   Show-PathDiff ([Environment]::GetEnvironmentVariable('Path', 'User')) $newPath
@@ -884,10 +1290,18 @@ if ($Launcher) { Write-Plan ('write launcher: ' + (Join-Path $Root 'launch-dsh.c
 $state = Read-State
 if (-not $state) { $state = [pscustomobject]@{} }
 $offers = @()
-if ($gitAsset -and $bashExe) {
-  $cmp = Compare-Ver $gitVer $gitAsset.Version
-  if ($cmp -lt 0) { $offers += @{ Name = 'bash'; Have = $(if ($gitVer) { $gitVer } else { $bashVer }); Want = $gitAsset.Version } }
-  elseif ($cmp -gt 0) { Write-Plan ('existing git ' + $gitVer + ' is newer than upstream ' + $gitAsset.Version + ': keeping it') }
+if ($bashAsset -and $bashExe) {
+  if (-not $bashHaveVer) {
+    if ($bashVer) {
+      Write-Plan ('existing bash ' + $bashVer + ' is a local install under ' + (Split-Path -Parent $bashExe) + ': no upgrade offer')
+    } else {
+      Write-Plan ('existing bash version unknown for provider ' + $bashProvider.Id + ': no upgrade offer')
+    }
+  } else {
+    $cmp = Compare-Ver $bashHaveVer ($bashAsset.Version -replace '^v', '')
+    if ($cmp -lt 0) { $offers += @{ Name = 'bash'; Have = $bashHaveVer; Want = ($bashAsset.Version -replace '^v', '') } }
+    elseif ($cmp -gt 0) { Write-Plan ('existing bash ' + $bashHaveVer + ' is newer than upstream ' + $bashAsset.Version + ': keeping it') }
+  }
 }
 if ($psAsset -and $pwshExe) {
   $cmp = Compare-Ver $pwshVer $psAsset.Version
@@ -898,9 +1312,12 @@ if ($psAsset -and $pwshExe) {
 # Version roots, not PATH entries: cleanup compares directories like git-2.56.1, while the PATH
 # front holds git-2.56.1\bin. Comparing the wrong level once marked the live install as retired.
 $activeDirs = @()
-if ($bashFinal) { $activeDirs += (Split-Path -Parent (Normalize-ShellDir $bashFinal)) }
-if ($pwshFinal) { $activeDirs += (Split-Path -Parent $pwshFinal) }
+if ($bashRootDir) { $activeDirs += $bashRootDir }
+if ($pwshRootDir) { $activeDirs += $pwshRootDir }
 
+if ($AllowDangerFullAccess) {
+  Write-Plan 'AllowDangerFullAccess: recorded. The shell runner needs danger-full-access for this bash.'
+}
 if ($PatchProfile) { Invoke-ProfilePatch }
 
 if ($ResolveOnly -or $DryRun) {
@@ -914,15 +1331,42 @@ if ($ResolveOnly -or $DryRun) {
 # Execute ------------------------------------------------------------------
 if ($needGit) {
   Write-Log ''
-  Write-Log '=== installing bash (PortableGit) ==='
-  $gitExe = Join-Path $Root $gitAsset.Name
-  Get-Download $gitAsset.Url $gitExe $gitAsset.Digest (Split-List $Mirror)
+  Write-Log ('=== installing bash (' + $bashProvider.Id + ') ===')
+  $archive = Join-Path $Root $bashAsset.Name
+  try {
+    Get-Download $bashAsset.Url $archive $bashAsset.Digest (Split-List $Mirror)
+  } catch {
+    Write-Log ('  download failed: ' + $_.Exception.Message)
+    Write-Escalation ('bash archive could not be downloaded (' + $_.Exception.Message + ')') $(if ($PatchProfile) { '-PatchProfile' } else { '' })
+    Write-Log ''
+    Write-Log 'stopped: nothing was installed.'
+    exit 3
+  }
   if (Test-Path -LiteralPath $gitDir) { Remove-Item -LiteralPath $gitDir -Recurse -Force }
-  & $gitExe ('-o' + $gitDir) '-y' | Out-Null
-  if (-not (Test-Path -LiteralPath (Join-Path $gitDir 'bin\bash.exe'))) { throw 'extraction produced no bin\bash.exe' }
-  Write-Log ('  bash: ' + (Join-Path $gitDir 'bin\bash.exe'))
-  & (Join-Path $gitDir 'bin\bash.exe') -c 'echo BASH_VERSION=$BASH_VERSION; uname -s'
-  if ($LASTEXITCODE -ne 0) { throw 'bash smoke test failed' }
+  if ($bashProvider.Pack -eq 'tar.gz') {
+    New-Item -ItemType Directory -Force -Path $gitDir | Out-Null
+    $ex = Invoke-NativeCapture 'tar.exe' @('-xzf', $archive, '-C', $gitDir)
+    if ($ex.ExitCode -ne 0) { throw ('tar.gz extraction failed: ' + ($ex.Lines -join ' ')) }
+    # The archive nests one directory (niubash-vX-win-ARCH): flatten it, or the entry path below moves.
+    $inner = @(Get-ChildItem -LiteralPath $gitDir -Directory -ErrorAction SilentlyContinue)
+    if ($inner.Count -eq 1 -and -not (Test-Path -LiteralPath (Join-Path $gitDir $bashProvider.Entry))) {
+      foreach ($child in @(Get-ChildItem -LiteralPath $inner[0].FullName -Force)) {
+        Move-Item -LiteralPath $child.FullName -Destination $gitDir -Force
+      }
+      Remove-Item -LiteralPath $inner[0].FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+  } else {
+    $ex = Invoke-NativeCapture $archive @(('-o' + $gitDir), '-y')
+    if ($ex.ExitCode -ne 0) { throw ('self-extracting archive failed: ' + ($ex.Lines -join ' ')) }
+  }
+  $installedBash = Join-Path $gitDir $bashProvider.Entry
+  if (-not (Test-Path -LiteralPath $installedBash)) { throw ('extraction produced no ' + $bashProvider.Entry) }
+  Write-Log ('  bash: ' + $installedBash)
+  # A bash that cannot run one command is not an install; fail here instead of writing PATH and
+  # leaving every later call broken.
+  $probe = Invoke-NativeCapture $installedBash @('-c', 'echo BASH_VERSION=$BASH_VERSION; uname -s')
+  if ($probe.ExitCode -ne 0) { throw ('installed bash cannot run under this mode: ' + ($probe.Lines -join ' ')) }
+  Write-Log ('  ' + (($probe.Lines | Select-Object -First 2) -join ' / '))
   $Wrote = $true
 }
 
@@ -930,14 +1374,24 @@ if ($needPs7) {
   Write-Log ''
   Write-Log '=== installing pwsh (PowerShell 7) ==='
   $zip = Join-Path $Root $psAsset.Name
-  Get-Download $psAsset.Url $zip $psAsset.Digest (Split-List $Mirror)
+  try {
+    Get-Download $psAsset.Url $zip $psAsset.Digest (Split-List $Mirror)
+  } catch {
+    Write-Log ('  download failed: ' + $_.Exception.Message)
+    Write-Escalation ('PowerShell archive could not be downloaded (' + $_.Exception.Message + ')') $(if ($PatchProfile) { '-PatchProfile' } else { '' })
+    Write-Log ''
+    Write-Log 'stopped: nothing was installed.'
+    exit 3
+  }
   if (Test-Path -LiteralPath $psDir) { Remove-Item -LiteralPath $psDir -Recurse -Force }
   Expand-Archive -LiteralPath $zip -DestinationPath $psDir -Force
   $sig = Get-AuthenticodeSignature -LiteralPath (Join-Path $psDir 'pwsh.exe')
   $signer = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { 'no certificate' }
   Write-Log ('  signature: ' + $sig.Status + ' / ' + $signer)
   if ($sig.Status -ne 'Valid') { throw 'pwsh.exe signature is not valid - refusing to trust this download' }
-  & (Join-Path $psDir 'pwsh.exe') -NoLogo -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'
+  $pv = Invoke-NativeCapture (Join-Path $psDir 'pwsh.exe') @('-NoLogo', '-NoProfile', '-Command', '$PSVersionTable.PSVersion.ToString()')
+  if ($pv.ExitCode -ne 0) { throw ('installed pwsh cannot run: ' + ($pv.Lines -join ' ')) }
+  Write-Log ('  pwsh version: ' + (($pv.Lines | Select-Object -First 1)))
   $Wrote = $true
 }
 
@@ -945,26 +1399,31 @@ if (-not $SkipPath) {
   Write-Log ''
   Write-Log '=== user PATH ==='
   $front = @()
-  if ($bashFinal) { $front += (Normalize-ShellDir $bashFinal) }
+  if ($bashPathDir) { $front += $bashPathDir }
   if ($pwshFinal) { $front += (Split-Path -Parent $pwshFinal) }
   $old = [Environment]::GetEnvironmentVariable('Path', 'User')
   $new = Compose-UserPath $front
   if ($old -eq $new) {
     Write-Log '  already correct, nothing to write'
   } else {
-    [Environment]::SetEnvironmentVariable('Path', $new, 'User')
-    $readBack = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if ($readBack -ne $new) { throw 'user PATH write did not take effect' }
-    Write-Log '  written and read back OK'
-    Show-PathDiff $old $readBack
-    $Wrote = $true
+    try {
+      [Environment]::SetEnvironmentVariable('Path', $new, 'User')
+      $readBack = [Environment]::GetEnvironmentVariable('Path', 'User')
+      if ($readBack -ne $new) { throw ('user PATH read-back differs: ' + $readBack) }
+      Write-Log '  written and read back OK'
+      Show-PathDiff $old $readBack
+      $Wrote = $true
+    } catch {
+      Write-Log ('  user PATH not written in this mode: ' + $_.Exception.Message)
+      Write-Escalation ('user PATH registry write denied (' + $_.Exception.Message + ')') $(if ($PatchProfile) { '-PatchProfile' } else { '' })
+    }
   }
   Write-Log '  NOTE: already-running processes keep their old PATH. Restart DSH.'
 }
 
 if ($Launcher) {
   $front = @()
-  if ($bashFinal) { $front += (Normalize-ShellDir $bashFinal) }
+  if ($bashPathDir) { $front += $bashPathDir }
   if ($pwshFinal) { $front += (Split-Path -Parent $pwshFinal) }
   Write-Launcher $front
 }
@@ -989,7 +1448,23 @@ if ($state) {
   Save-State $state
 }
 
+if ($Restart) {
+  $restartScript = Join-Path $PSScriptRoot 'restart-dsh.ps1'
+  if (Test-Path -LiteralPath $restartScript) {
+    Write-Log ''
+    Write-Log '=== restart ==='
+    & $restartScript
+  } else {
+    Write-Log ('  cannot restart: ' + $restartScript + ' is missing')
+  }
+}
+
 Write-Log ''
 if ($PatchProfile) { Write-Log ('DONE. wrote=' + $Wrote + '. Profile patch handled; restart DSH to apply it.') }
 else { Write-Log ('DONE. wrote=' + $Wrote + '. Next: apply the DSH profile patch (SKILL.md section 7), then restart DSH.') }
 if (-not $Wrote -and $offers.Count -eq 0) { Write-Log 'Nothing needed changing on this machine.' }
+if ($script:Escalated) {
+  Write-Log ''
+  Write-Log 'exit 3: at least one step needed danger-full-access. Escalate and rerun, do not report success.'
+  exit 3
+}

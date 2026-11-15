@@ -4,6 +4,11 @@
 
   -DshExe PATH   override the discovery
   -ResolveOnly   print the discovered path and exit (no process is touched)
+
+  PATH is re-read from the registry right before starting DSH. Start-Process inherits THIS
+  process's environment block, so a caller launched before the PATH change (a long-lived host,
+  or a terminal opened earlier) would otherwise hand DSH the stale block and bash would stay
+  unfindable no matter how often it is restarted.
 #>
 [CmdletBinding()]
 param(
@@ -60,6 +65,17 @@ if ($p) {
   Write-Host ('stopping ' + $p.Count + ' process(es)')
   $p | Stop-Process -Force
   Start-Sleep -Seconds 4
+}
+# Same trap as the deferred-environment case: the child inherits this block, not the registry.
+# Rebuild machine+user PATH here so the restarted DSH sees what was written after this shell
+# started. -UseNewEnvironment is not used: it wipes the rest of the block (PSModulePath, TEMP)
+# instead of refreshing it, and the child fails to start on Windows PowerShell 5.1.
+$machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+$userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+$freshPath = (@($machinePath, $userPath) | Where-Object { $_ }) -join ';'
+if ($freshPath) {
+  $env:Path = $freshPath
+  Write-Host ('PATH refreshed for the child: ' + ($freshPath.Length) + ' chars')
 }
 Start-Process -FilePath $exe
 Write-Host 'started. This window can be closed.'
