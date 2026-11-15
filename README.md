@@ -13,12 +13,38 @@
 一个 **agent skill**（不是插件）：一份能被任意 agent 读懂并执行的文档 + 一组可直接运行的 PowerShell 脚本。
 
 - 不侵入 DSH 代码，不注册任何服务；
-- 只依赖官方发行物：Git for Windows 的 PortableGit、微软的 PowerShell 7；
+- 依赖官方发行物 + 一个第三方 bash：Git for Windows 的 PortableGit、微软的 PowerShell 7，以及 [Niubash](https://github.com/unixwin/niubash)（MIT，无 POSIX 模拟层的原生 bash，见下）；
 - DSH 升级、换机器、换 agent 都还能用；删掉即可卸载。
+
+## 为什么需要换一个 bash
+
+DSH 在 Windows 上有两种沙箱档：`workspace-write` / `read-only` 用受限令牌 + Low 完整性级别跑子进程。**MSYS 系 bash（PortableGit 自带）在这种沙箱里连启动都做不到**——它在启动阶段要建一个 signal pipe，而受限令牌打不开那个命名管道，于是报：
+
+```
+*** fatal error - couldn't create signal pipe, Win32 error 5
+```
+
+这不是权限配置问题，也不是环境变量问题，切到 `danger-full-access` 就正常。所以"受限模式下能不能用 bash"这个问题的答案是：**MSYS 系不行，需要没有 POSIX 模拟层的实现**。
+
+Niubash 就是这样一个实现（原生 Windows，无 MSYS/Cygwin 运行时）。本技能用 `-BashSource sandbox` 装它；`-BashSource portablegit` 仍保留旧路径。
+
+## 架构与资产
+
+按 **OS 架构**判断（不是进程位数；32 位进程跑在 64 位系统上也能选对）：
+
+| OS 架构 | bash 默认（`-BashSource sandbox`/`auto`） | bash 备选（`-BashSource portablegit`） | pwsh |
+|---|---|---|---|
+| `x64` | `niubash-v<v>-win-x64.tar.gz` | `PortableGit-<v>-64-bit.7z.exe` | `PowerShell-<v>-win-x64.zip` |
+| `ARM64` | `niubash-v<v>-win-arm64.tar.gz` | `PortableGit-<v>-arm64.7z.exe` | `PowerShell-<v>-win-arm64.zip` |
+| `x86` | **不可用**（niubash 不发 32 位） | Git 最新版已停发 32 位，脚本分页回溯到最后一个有包的稳定版（当前 `v2.50.1`） | `PowerShell-<v>-win-x86.zip` |
+
+回溯只用于 `latest`：显式 `-GitVersion` / `-Ps7Version` 不回退，缺包直接报错；回溯跳过 prerelease。
 
 ## 它解决什么
 
 Windows 上的 DSH 默认只有 PowerShell 执行器；各内置预设把 `tool-bash` 在 win32 上禁用，因为裸 `bash` 可能解析到 `C:\Windows\System32\bash.exe`（WSL 占位入口，没装发行版时跑不了命令）。
+
+已知限制：**32 位（x86）Windows 没有可用的原生 bash**——niubash 不发 32 位构建，PortableGit 也停在 v2.50.1，且 32 位只能走 PortableGit，因此在受限沙箱下不可用（只能用 `-AllowDangerFullAccess`）。
 
 本技能做两件事：
 
@@ -99,8 +125,8 @@ setup-tools.ps1 -Upgrade -KeepOldVersions   # 保留旧版本目录
 | 位置 | 改动 | 可逆性 |
 |---|---|---|
 | `%LOCALAPPDATA%\dsh-tools` | 只在"缺"或"升级"时解压 PortableGit / PowerShell 7，目录带版本号；解压后删压缩包、升级后删旧版本目录（`-KeepArchives` / `-KeepOldVersions` 可关掉） | `restore.ps1 -Uninstall -DeleteTools` |
-| 用户 PATH | 把选中的目录**提到最前**（并删掉自己装过的过期条目） | `restore.ps1 -RestorePath` |
-| `<DSH home>\profiles\*\cordis.patch.yml` | 追加一段执行器切换条目（`bash-sandbox`） | `restore.ps1` 逐字节还原 |
+| 用户 PATH | 把选中的目录**提到最前**（并删掉自己装过的过期条目） | `restore.ps1 -Uninstall`（会剔除 `-ToolsRoot` 下的条目） |
+| `<DSH home>\profiles\*\cordis.patch.yml` | 追加一段带标记的执行器条目（`bash-sandbox`） | `restore.ps1` **只删这一段**，文件其余部分不动 |
 | `%LOCALAPPDATA%\dsh-windows-shell\state.json` | 记录"检查过/已提议/已拒绝"的版本 | 删文件 |
 
 **PATH 的硬边界**：Windows 的生效顺序是"机器级在前、用户级在后"，所以 `C:\Windows\System32\bash.exe`（装了 WSL 才有）永远压过用户 PATH。这种情况下脚本会告警，并可以用 `-Launcher` 生成一个先把目录塞进 PATH 再启动 DSH 的 ```launch-dsh.cmd```。
@@ -115,12 +141,16 @@ setup-tools.ps1 -Upgrade -KeepOldVersions   # 保留旧版本目录
 | 用户 PATH（回到快照那一刻的值） | 清理阶段删掉的安装包（`.7z.exe` / `.zip`） |
 | | 清理阶段删掉的旧版本目录 |
 
-要彻底回到"没装过"的状态：`restore.ps1 -Uninstall -DeleteTools`（先还原配置与 PATH，再删 `-Root` 目录）。
+回滚是**整份还原**：把每个 `cordis.patch.yml` 逐字节写回快照那份、用户 PATH 写回快照原值，卸载时删掉工具目录。因此 `-Snapshot` 必须在技能第一次改动**之前**跑；没有快照脚本会直接拒绝。
+
+`cordis.yml` / `package.json` 技能从不写，也从不快照、从不还原。
+
+要彻底回到"没装过"的状态：`restore.ps1 -Uninstall -DeleteTools`（删 shell block、清 PATH、删 `-Root`，并连同 `%LOCALAPPDATA%\dsh-windows-shell` 里的快照一起清掉；想留快照加 `-KeepState`）。
 
 ```powershell
 restore.ps1 -DryRun          # 只看差异
 restore.ps1                  # 逐字节还原配置
-restore.ps1 -RestorePath     # 连 PATH 一起还原
+restore.ps1 -Uninstall       # 删 block + 还原/清理 PATH，并列出工具目录
 restore.ps1 -Restart         # 还原并重启 DSH
 restore.ps1 -Uninstall                 # 还原 + 列出手上的工具目录
 restore.ps1 -Uninstall -DeleteTools    # 连工具目录一起删
@@ -131,7 +161,8 @@ DSH 可执行文件路径是**运行时探测**的（运行中的进程 → 卸�
 ## 已验证 / 未验证
 
 - 已验证（本机实测）：探测能识别系统 Git 的 bash 2.56.0 与 pwsh 7.6.9，正确给出 `UPGRADE-OFFER` 且不下载；真实升级后再跑一次会走"已最新"分支并把遗留压缩包删掉（实测 167.3 MB，780→613 MB，正在使用的目录与诱饵目录均未受影响）；`-DryRun` 不改 PATH、不建目录；镜像测速真实选中 `gh-proxy.com` 并完成下载；sha256 校验、验签、解压后 smoke test 通过；`restore.ps1` 快照 6 个文件、`-DryRun` 全部 SAME、`-Uninstall -DryRun` 只比对不写盘；`restart-dsh.ps1 -ResolveOnly` 与 `restart-dsh.cmd -ResolveOnly`（参数转发）都能解析到真实 exe；全部脚本纯 ASCII、在 Windows PowerShell 5.1 下跑通。
-- 未验证：全新无 Git / 无 PS7 机器上的首次安装（路径分支存在但未实跑）；`bash-sandbox` 在 read-only / workspace-write 档下的沙箱 runner 在 Windows 上能否启动；`-AskUpgrade` 在无控制台时的实际交互（逻辑已按"跳过"处理）。
+- 未验证：全新无 Git / 无 PS7 机器上的首次安装（路径分支存在但未实跑）；`-AskUpgrade` 在无控制台时的实际交互（逻辑已按"跳过"处理）。
+- 已证不可用（issue #1）：MSYS 系 bash（PortableGit 自带）在受限沙箱（workspace-write / read-only）下启动即失败，报 `couldn't create signal pipe, Win32 error 5`。改用 `-BashSource sandbox`（niubash）后同档实测可跑，且写工作区外仍被拒绝。
 
 ## English summary
 
