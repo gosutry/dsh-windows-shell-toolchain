@@ -53,7 +53,11 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup-tools.ps1 -PatchProfile -DryRun
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts\setup-tools.ps1 -PatchProfile
 
-- 用 `bash-sandbox`，不要 `bash-local`：后者没有 `sandboxMode`，权限预设插件拒绝挂载，聊天框模式选择器会消失
+- 写的是**双执行器块**：`tool-bash` / `bash-sandbox` 一对挂 `isolate: { shell: bash }`，`pwsh-sandbox` 留在默认 realm 并带 `pwshPath`，`tool-pwsh` 由预设挂载后连到它
+- 一个上下文只有一份 `ctx.shell`：工具与执行器要配对，两边的 `isolate` label 必须一致；写 `shell: true` 会各得私有 realm、配不上对
+- 补丁在**安装之后**才写，所以 `pwshPath` 指向真实存在的 exe；`-SkipPs7` 且本机没有 pwsh 时直接 `exit 1`，不写指向空处的执行器
+- 写入是原地替换：新标记 `isolated dual executor` 与旧标记 `bash executor (sandboxing variant)` 都会被识别并从较早处截断，不要在同一个文件里手工再写第二段
+- 用 `*-sandbox` 而不是 `*-local`：后者没有 `sandboxMode`，权限预设插件拒绝挂载，聊天框模式选择器会消失
 - 按 id 定位是**字段级覆盖**：只改写补丁里写出的键，其余原样保留；只有 `config` 这一键是整块替换（不深合并）。`name` 写上会做校验，写错整条跳过
 - `cwd` 默认当前目录，`-Workspace` 指定
 
@@ -76,8 +80,9 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
 1. 工具表里有 `bash`
 2. `bash -c 'echo $BASH_VERSION; uname -s'` → exit 0
 3. `bash -c 'echo $0; uname -s; pwd'` → exit 0
-4. 开 subagent，让它自报工具名并实跑一条
-5. 聊天框的权限选择器与 `/permission` 仍在
+4. `pwsh -NoProfile -Command '$PSVersionTable.PSVersion.ToString()'` → `7.7.0`（能跑通才说明两个 realm 配对正确；报 bash 语法错说明补丁没生效或没重启）
+5. 开 subagent，让它自报工具名并实跑一条
+6. 聊天框的权限选择器与 `/permission` 仍在
 
 ## 9. 故障排查
 
@@ -159,6 +164,6 @@ whenToUse: Windows 上 DSH 没有 bash 工具、或只有 5.1 版 PowerShell；�
 
 - `run_code` 的子进程 env 是空的：显式传 `-Root` 与 `-StateDir`，自建 env 别漏 `PATHEXT`，否则 `Get-Command bash` 会说谎
 - 验 exe 用 `bash` 工具或 Node `spawn`，别在单引号里读 `$LASTEXITCODE`
-- `pwsh` 工具经 bash 转发，不能直传 PowerShell 语法 → `pwsh -NoProfile -Command '...'`
+- 应用双执行器块并重启后，`pwsh` 工具应能直接吃 PowerShell 语法；仍报 bash 语法错就查 `profiles\<p>\cordis.patch.yml` 是否写入、DSH 是否重启过
 - PATH 改完未重启时 `bash` / `pwsh` 都报 `spawn bash ENOENT`：用 Node 起 `C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe` 继续诊断，别报"装不了"
 - 被调用超时掐断先查盘上状态再重跑，同一条命令别跑第三次

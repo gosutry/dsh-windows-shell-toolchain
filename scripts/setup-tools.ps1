@@ -867,31 +867,56 @@ function Write-Launcher([string[]]$Dirs) {
 # Profile patch (SKILL.md section 7) ----------------------------------------
 # The one step that used to be a hand-written YAML edit. The block is idempotent: it is
 # replaced wherever its marker already exists, so re-running never stacks duplicates.
-$PatchMarker = '# ===== shell toolchain: bash executor (sandboxing variant) ====='
+$PatchMarker = '# ===== shell toolchain: isolated dual executor ====='
 
-function New-PatchBlock([string]$WorkspacePath) {
-  @(
+# Markers written by earlier releases. The writer cuts at whichever marker comes first, so a
+# profile patched by an older script is replaced instead of gaining a second block beside the
+# old one (two blocks would put the same ids in the file twice and fail Test-PatchText).
+$LegacyPatchMarkers = @('# ===== shell toolchain: bash executor (sandboxing variant) =====')
+
+function New-PatchBlock([string]$WorkspacePath, [string]$PwshPath) {
+  # One executor per realm. A consumer and its provider pair up only when both carry the same
+  # isolate label, so pinning the bash pair to the label 'bash' frees the default realm for the
+  # PowerShell executor that the preset-mounted `pwsh` tool consumes. With a single executor in
+  # the default realm both tool names were served by one engine: `pwsh` silently ran bash and
+  # PowerShell syntax came back as a bash syntax error with exit status 2.
+  #
+  # Written after the install step, so a run that could not provide pwsh never writes an
+  # executor pointing at a missing executable.
+  $lines = @(
     $PatchMarker,
     '# Written by setup-tools.ps1 -PatchProfile. Re-running replaces this block;',
     '# everything above the marker is left untouched.',
     '- id: tool-bash',
     "  name: '@deepseek-ai/dsh-tool-bash'",
     '  disabled: false',
+    '  isolate:',
+    '    shell: bash',
     '- id: tool-pwsh',
     "  name: '@deepseek-ai/dsh-tool-pwsh'",
     '  disabled: true',
     '- id: pwsh-sandbox',
     "  name: '@deepseek-ai/dsh-pwsh-sandbox'",
-    '  disabled: true',
+    '  disabled: false',
+    '  config:',
+    ("    cwd: '" + $WorkspacePath + "'"),
+    '    timeoutMs: 120000',
+    '    maxTimeoutMs: 600000'
+  )
+  if ($PwshPath) { $lines += @(("    pwshPath: '" + $PwshPath + "'")) }
+  $lines += @(
     '- id: bash-sandbox',
     "  name: '@deepseek-ai/dsh-bash-sandbox'",
     '  disabled: false',
+    '  isolate:',
+    '    shell: bash',
     '  config:',
     ("    cwd: '" + $WorkspacePath + "'"),
     '    timeoutMs: 120000',
     '    maxTimeoutMs: 600000',
     ''
   )
+  return $lines
 }
 
 # PowerShell 5.1 has no YAML parser, so validate the shape this file must keep: the four ids
@@ -932,11 +957,21 @@ function Invoke-ProfilePatch {
     if ((Test-Path -LiteralPath $p) -or ($wanted -contains $d.Name)) { $files += $p }
   }
   if ($files.Count -eq 0) { Write-Plan 'no cordis.patch.yml found; nothing patched'; return }
-  $block = (New-PatchBlock $ws) -join [string][char]13 + [string][char]10
+  # Called after the install step (dry-run previews before it), so this records what is actually
+  # on disk. When this same run installs pwsh, $needPs7 is true and $pwshFinal is where it lands.
+  $pwshKnown = [bool]($pwshFinal -and ($pwshFinal -notmatch "'"))
+  $pwshForPatch = if (-not $pwshKnown) { '' }
+                  elseif ((Test-Path -LiteralPath $pwshFinal) -or $needPs7) { $pwshFinal }
+                  else { '' }
+  $block = (New-PatchBlock $ws $pwshForPatch) -join [string][char]13 + [string][char]10
   foreach ($f in $files) {
     $old = ''
     if (Test-Path -LiteralPath $f) { $old = [System.IO.File]::ReadAllText($f) }
-    $idx = $old.IndexOf($PatchMarker)
+    $idx = -1
+    foreach ($mk in (@($PatchMarker) + $LegacyPatchMarkers)) {
+      $i = $old.IndexOf($mk)
+      if (($i -ge 0) -and (($idx -lt 0) -or ($i -lt $idx))) { $idx = $i }
+    }
     $head = if ($idx -ge 0) { $old.Substring(0, $idx) } else { $old }
     $head = $head.TrimEnd() + [string][char]13 + [string][char]10 + [string][char]13 + [string][char]10
     $new = $head + $block
@@ -1318,9 +1353,17 @@ if ($pwshRootDir) { $activeDirs += $pwshRootDir }
 if ($AllowDangerFullAccess) {
   Write-Plan 'AllowDangerFullAccess: recorded. The shell runner needs danger-full-access for this bash.'
 }
-if ($PatchProfile) { Invoke-ProfilePatch }
+# -PatchProfile describes what this run actually provides. -SkipPs7 with no pwsh on the machine
+# cannot provide the PowerShell half; refuse rather than write an executor that points nowhere.
+if ($PatchProfile -and $SkipPs7 -and -not $pwshExe) {
+  Write-Log ''
+  Write-Log 'stopped: -PatchProfile needs a pwsh, but -SkipPs7 was given and no usable pwsh was found.'
+  Write-Log '  install PowerShell 7 first, or drop -SkipPs7.'
+  exit 1
+}
 
 if ($ResolveOnly -or $DryRun) {
+  if ($PatchProfile) { Invoke-ProfilePatch }
   Invoke-Cleanup $activeDirs
   foreach ($o in $offers) { Write-Log ('UPGRADE-OFFER ' + $o.Name + ' ' + $o.Have + ' -> ' + $o.Want) }
   Write-Log ''
@@ -1394,6 +1437,9 @@ if ($needPs7) {
   Write-Log ('  pwsh version: ' + (($pv.Lines | Select-Object -First 1)))
   $Wrote = $true
 }
+
+# Written after both installs: the block records a pwsh that is actually on disk.
+if ($PatchProfile) { Invoke-ProfilePatch }
 
 if (-not $SkipPath) {
   Write-Log ''
