@@ -48,7 +48,7 @@ Windows 上的 DSH 默认只有 PowerShell 执行器；各内置预设把 `tool-
 
 本技能做两件事：
 
-1. 让一个**真 bash** 真的生效：已有的直接用（并提到 PATH 最前），没有的装 PortableGit；
+1. 让一个**真 bash** 真的生效：已有的直接用（并提到 PATH 最前），没有的装 niubash / PortableGit（32位windows仅装这个）；
 2. 补上 pwsh 7（有 MSI 版就不动它），并把 DSH 的 profile 执行器换成 **`bash-sandbox`**（带 `sandboxMode`，因此权限预设与 `/permission` 不受影响）。
 
 ## 安装
